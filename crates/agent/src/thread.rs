@@ -223,7 +223,9 @@ pub struct BackgroundSubagent {
     pub label: SharedString,
     pub status: SubagentStatus,
     /// Weak handle to the subagent's thread, for inspection and cancellation.
-    pub thread: WeakEntity<Thread>,
+    /// `None` for subagents restored from disk after a restart (their live
+    /// thread isn't loaded into memory).
+    pub thread: Option<WeakEntity<Thread>>,
     /// Whether the terminal result has already been delivered back to the
     /// primary agent (via auto-pull or an explicit collect tool).
     pub delivered: bool,
@@ -231,9 +233,10 @@ pub struct BackgroundSubagent {
     /// running. Drained by the driver after each turn completes.
     pending_messages: Vec<String>,
     /// The detached driver task. Held here purely to keep the work alive;
-    /// dropping it cancels the subagent (GPUI Task semantics).
+    /// dropping it cancels the subagent (GPUI Task semantics). `None` for
+    /// subagents restored from disk (their driver did not survive the restart).
     #[allow(dead_code)]
-    driver: Task<()>,
+    driver: Option<Task<()>>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -1922,7 +1925,39 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
-            background_subagents: HashMap::default(),
+            background_subagents: db_thread
+                .background_subagents
+                .into_iter()
+                .map(|subagent| {
+                    // A subagent that was running when Zed last closed can't keep
+                    // running (its driver is gone), so restore it as interrupted.
+                    // Its session/context is still on disk, so it remains listable.
+                    let status = match subagent.status.as_str() {
+                        "completed" => SubagentStatus::Completed {
+                            output: subagent.output.unwrap_or_default(),
+                        },
+                        "cancelled" => SubagentStatus::Cancelled,
+                        "running" => SubagentStatus::Failed {
+                            error: "Interrupted (Zed was restarted)".to_string(),
+                        },
+                        _ => SubagentStatus::Failed {
+                            error: subagent.error.unwrap_or_else(|| "failed".to_string()),
+                        },
+                    };
+                    (
+                        subagent.session_id.clone(),
+                        BackgroundSubagent {
+                            session_id: subagent.session_id,
+                            label: subagent.label.into(),
+                            status,
+                            thread: None,
+                            delivered: subagent.delivered,
+                            pending_messages: Vec::new(),
+                            driver: None,
+                        },
+                    )
+                })
+                .collect(),
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
@@ -2025,6 +2060,28 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            background_subagents: self
+                .background_subagents
+                .values()
+                .map(|subagent| {
+                    let (status, output, error) = match &subagent.status {
+                        SubagentStatus::Running => ("running", None, None),
+                        SubagentStatus::Completed { output } => {
+                            ("completed", Some(output.clone()), None)
+                        }
+                        SubagentStatus::Failed { error } => ("failed", None, Some(error.clone())),
+                        SubagentStatus::Cancelled => ("cancelled", None, None),
+                    };
+                    crate::db::DbBackgroundSubagent {
+                        session_id: subagent.session_id.clone(),
+                        label: subagent.label.to_string(),
+                        status: status.to_string(),
+                        output,
+                        error,
+                        delivered: subagent.delivered,
+                    }
+                })
+                .collect(),
         };
 
         cx.background_spawn(async move {
@@ -4342,10 +4399,10 @@ impl Thread {
                 session_id,
                 label,
                 status: SubagentStatus::Running,
-                thread,
+                thread: Some(thread),
                 delivered: false,
                 pending_messages: Vec::new(),
-                driver,
+                driver: Some(driver),
             },
         );
         cx.notify();
@@ -4495,7 +4552,7 @@ impl Thread {
         let Some(subagent) = self.background_subagents.get_mut(session_id) else {
             anyhow::bail!("No background subagent with session id {session_id}");
         };
-        if let Some(thread) = subagent.thread.upgrade() {
+        if let Some(thread) = subagent.thread.as_ref().and_then(|thread| thread.upgrade()) {
             thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
         }
         if !subagent.status.is_terminal() {

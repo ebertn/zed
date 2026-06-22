@@ -5986,6 +5986,109 @@ async fn test_auto_pull_delivers_finished_subagent_when_idle(cx: &mut TestAppCon
     );
 }
 
+/// Background subagents (and their results) survive a save/load roundtrip. A
+/// subagent that was running when saved is restored as interrupted, since its
+/// driver doesn't survive a restart.
+#[gpui::test]
+async fn test_background_subagents_persist_through_db(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+
+    let parent = cx.new(|cx| {
+        Thread::new(
+            project.clone(),
+            project_context.clone(),
+            context_server_registry.clone(),
+            Templates::new(),
+            Some(model.clone()),
+            cx,
+        )
+    });
+
+    let id_completed = acp::SessionId::new(Arc::from("sub-completed"));
+    let id_running = acp::SessionId::new(Arc::from("sub-running"));
+
+    parent.update(cx, |thread, cx| {
+        let weak = cx.weak_entity();
+        thread.register_background_subagent(
+            id_completed.clone(),
+            "Completed work".into(),
+            weak.clone(),
+            Task::ready(()),
+            cx,
+        );
+        thread.set_background_subagent_status(
+            &id_completed,
+            SubagentStatus::Completed {
+                output: "the result".to_string(),
+            },
+            cx,
+        );
+        thread.register_background_subagent(
+            id_running.clone(),
+            "Running work".into(),
+            weak,
+            Task::ready(()),
+            cx,
+        );
+        // id_running is left in the Running state.
+    });
+
+    let db = parent.update(cx, |thread, cx| thread.to_db(cx)).await;
+    let parent_id = parent.read_with(cx, |thread, _| thread.id().clone());
+
+    let restored = cx.new(|cx| {
+        Thread::from_db(
+            parent_id,
+            db,
+            project.clone(),
+            project_context.clone(),
+            context_server_registry.clone(),
+            Templates::new(),
+            cx,
+        )
+    });
+
+    let (completed, running) = restored.read_with(cx, |thread, _| {
+        (
+            thread
+                .background_subagent(&id_completed)
+                .map(|subagent| match &subagent.status {
+                    SubagentStatus::Completed { output } => format!("completed:{output}"),
+                    other => other.label().to_string(),
+                }),
+            thread
+                .background_subagent(&id_running)
+                .map(|subagent| subagent.status.label().to_string()),
+        )
+    });
+
+    assert_eq!(
+        completed,
+        Some("completed:the result".to_string()),
+        "a completed subagent should round-trip with its output preserved"
+    );
+    assert_eq!(
+        running,
+        Some("failed".to_string()),
+        "a running subagent should restore as interrupted (failed), not vanish"
+    );
+}
+
 #[gpui::test]
 async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppContext) {
     init_test(cx);
