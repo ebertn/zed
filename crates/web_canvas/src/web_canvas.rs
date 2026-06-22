@@ -1706,8 +1706,16 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
     } catch (e) {
       fail('run: ' + String((e && e.stack) || e));
     }
-    // Report the post-render error state (empty list means success).
-    window.__reportCanvasErrors();
+    // Report after the browser has actually painted. `createRoot().render()` is
+    // asynchronous, so reporting synchronously here fires before the WebView has
+    // any pixels; the host would then redraw the transparency hole over an empty
+    // (black) view and never redraw again. A double rAF waits until after the
+    // first paint so the host's redraw composites over real content.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        window.__reportCanvasErrors();
+      });
+    });
   })();
 </script>
 
