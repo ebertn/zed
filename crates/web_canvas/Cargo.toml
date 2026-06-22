@@ -11,6 +11,7 @@ path = "src/web_canvas.rs"
 agent.workspace = true
 agent-client-protocol.workspace = true
 anyhow.workspace = true
+editor.workspace = true
 gpui.workspace = true
 log.workspace = true
 paths.workspace = true
@@ -21,7 +22,6 @@ serde_json.workspace = true
 settings.workspace = true
 surface.workspace = true
 theme.workspace = true
-theme_settings.workspace = true
 ui.workspace = true
 workspace.workspace = true
 

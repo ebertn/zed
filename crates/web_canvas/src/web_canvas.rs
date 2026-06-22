@@ -14,14 +14,16 @@
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity,
-    Window, WindowBackgroundAppearance, actions, canvas, div,
+    SharedString, Styled as _, Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance,
+    actions, canvas, div,
 };
 use workspace::{Item, Workspace};
 
 use agent::{AgentTool, Thread, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema as acp;
 use anyhow::{Result, anyhow};
+use editor::Editor;
+use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -241,7 +243,8 @@ impl SurfaceProvider for CanvasProvider {
                 .ok_or_else(|| anyhow!("canvas open requires a file `path`"))?,
         );
 
-        let view = cx.new(|cx| CanvasView::new(title, path, window, cx));
+        let project = workspace.project().clone();
+        let view = cx.new(|cx| CanvasView::new(title, path, project, window, cx));
         workspace.active_pane().update(cx, |pane, cx| {
             pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
         });
@@ -667,11 +670,14 @@ struct CanvasView {
     // The window this canvas lives in, used to scope transparency to windows
     // that actually host a canvas.
     window_handle: AnyWindowHandle,
+    // Used to open the backing file as a real, syntax-highlighted buffer for the
+    // code view.
+    project: Entity<Project>,
     // Whether the tab shows the rendered canvas or its source.
     mode: CanvasMode,
-    // The current `.canvas.tsx` source, shown in `CanvasMode::Code` and kept in
-    // sync with the file (and agent edits) via the watch task.
-    source: String,
+    // A read-only editor over the backing file, lazily created the first time
+    // the code view is shown.
+    code_editor: Option<Entity<Editor>>,
     // The current full HTML document, shared with the WebView's custom-protocol
     // handler so updates just mutate this and reload.
     #[cfg(target_os = "macos")]
@@ -696,6 +702,7 @@ impl CanvasView {
     fn new(
         title: SharedString,
         path: PathBuf,
+        project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -721,8 +728,9 @@ impl CanvasView {
             path,
             focus_handle: cx.focus_handle(),
             window_handle,
+            project,
             mode: CanvasMode::Rendered,
-            source: content,
+            code_editor: None,
             #[cfg(target_os = "macos")]
             document,
             #[cfg(target_os = "macos")]
@@ -766,11 +774,7 @@ impl CanvasView {
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    fn set_content(&mut self, content: &str, cx: &mut Context<Self>) {
-        self.source = content.to_string();
-        // Refresh the code view if it's showing; the WebView reload below covers
-        // the rendered view.
-        cx.notify();
+    fn set_content(&mut self, content: &str, _cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
             *self.document.borrow_mut() =
@@ -786,7 +790,7 @@ impl CanvasView {
     /// Switches between the rendered canvas and its source. Hides the WebView in
     /// code mode so the (opaque) code view isn't drawn over a live WebView; the
     /// rendered mode's `canvas()` positioner shows it again on switch back.
-    fn set_mode(&mut self, mode: CanvasMode, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: CanvasMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == mode {
             return;
         }
@@ -798,7 +802,41 @@ impl CanvasView {
         {
             log::error!("canvas: set_visible(false) failed: {err}");
         }
+        if mode == CanvasMode::Code && self.code_editor.is_none() {
+            self.load_code_editor(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Opens the backing file as a project buffer and builds a read-only editor
+    /// for it (syntax highlighting, scrolling, selection). Runs once, lazily.
+    fn load_code_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        let project = self.project.clone();
+        let buffer_task =
+            project.update(cx, |project, cx| project.open_local_buffer(&path, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let buffer = match buffer_task.await {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    log::error!("canvas: failed to open source buffer: {err}");
+                    return;
+                }
+            };
+            let result = this.update_in(cx, |this, window, cx| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
+                    editor.set_read_only(true);
+                    editor
+                });
+                this.code_editor = Some(editor);
+                cx.notify();
+            });
+            if let Err(err) = result {
+                log::error!("canvas: failed to install code editor: {err}");
+            }
+        })
+        .detach();
     }
 
     /// Rebuilds the document with the latest host theme and reloads the WebView.
@@ -867,12 +905,12 @@ impl CanvasView {
             [
                 ToggleButtonSimple::new("Canvas", {
                     let view = view.clone();
-                    move |_, _window, cx| {
-                        view.update(cx, |this, cx| this.set_mode(CanvasMode::Rendered, cx));
+                    move |_, window, cx| {
+                        view.update(cx, |this, cx| this.set_mode(CanvasMode::Rendered, window, cx));
                     }
                 }),
-                ToggleButtonSimple::new("Code", move |_, _window, cx| {
-                    view.update(cx, |this, cx| this.set_mode(CanvasMode::Code, cx));
+                ToggleButtonSimple::new("Code", move |_, window, cx| {
+                    view.update(cx, |this, cx| this.set_mode(CanvasMode::Code, window, cx));
                 }),
             ],
         )
@@ -890,35 +928,21 @@ impl CanvasView {
             .child(toggle)
     }
 
-    /// A scrollable, read-only view of the `.canvas.tsx` source.
+    /// A read-only editor over the `.canvas.tsx` source, or a placeholder while
+    /// the buffer is still opening.
     fn render_code_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use settings::Settings as _;
         use theme::ActiveTheme as _;
 
         let colors = cx.theme().colors();
-        let buffer_font = theme_settings::ThemeSettings::get_global(cx)
-                .buffer_font
-                .clone();
-
-        div()
-            .id("canvas-code-view")
-            .size_full()
-            .overflow_y_scroll()
-            .bg(colors.editor_background)
-            .text_color(colors.text)
-            .font(buffer_font)
-            .text_size(gpui::px(12.0))
-            .px_4()
-            .py_3()
-            .children(self.source.lines().map(|line| {
-                // Render each line as its own element so newlines are preserved;
-                // blank lines keep a non-breaking space to retain their height.
-                div().child(if line.is_empty() {
-                    SharedString::from("\u{00a0}")
-                } else {
-                    SharedString::from(line.to_string())
-                })
-            }))
+        let container = div().size_full().bg(colors.editor_background);
+        match &self.code_editor {
+            Some(editor) => container.child(editor.clone()),
+            None => container
+                .text_color(colors.text_muted)
+                .px_4()
+                .py_3()
+                .child("Loading source…"),
+        }
     }
 }
 
