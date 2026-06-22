@@ -52,7 +52,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &OpenCanvasSpike, window, cx| {
-            let path = match prepare_canvas_file("Canvas Spike", DEFAULT_CANVAS) {
+            let path = match prepare_canvas_file("Canvas Spike", DEFAULT_CANVAS, true) {
                 Ok(path) => path,
                 Err(err) => {
                     log::error!("canvas: {err:#}");
@@ -349,10 +349,10 @@ fn slugify(title: &str) -> String {
 /// `~/.agents/canvases/<slug>.canvas.tsx` exists, writing `default_content` only
 /// if the file is new (an existing canvas with the same title is left intact so
 /// it can be reopened by identifier). Returns the file path.
-fn prepare_canvas_file(title: &str, default_content: &str) -> Result<PathBuf> {
+fn prepare_canvas_file(title: &str, default_content: &str, overwrite: bool) -> Result<PathBuf> {
     scaffold_canvas_project();
     let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(title)));
-    if !path.exists() {
+    if overwrite || !path.exists() {
         std::fs::write(&path, default_content)
             .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))?;
     }
@@ -561,7 +561,7 @@ impl AgentTool for CanvasOpenTool {
             let input = input.recv().await.map_err(|err| err.to_string())?;
             // Create a starter file only if this canvas doesn't exist yet; an
             // existing canvas with the same title is reopened as-is.
-            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title))
+            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title), false)
                 .map_err(|err| err.to_string())?;
             // Make the canvases dir a (non-visible) worktree so `edit_file` and the
             // language server work on the file before the agent edits it.
