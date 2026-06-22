@@ -35,6 +35,8 @@ use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimpl
 
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, rc::Rc};
+#[cfg(target_os = "macos")]
+use futures::{StreamExt as _, channel::mpsc};
 
 pub fn init(cx: &mut App) {
     surface::register_surface_provider(cx, Arc::new(CanvasProvider));
@@ -783,6 +785,10 @@ struct CanvasView {
     // rendered cleanly). Read by the `canvas_errors` tool.
     #[cfg(target_os = "macos")]
     errors: Rc<RefCell<Vec<String>>>,
+    // Redraws the view whenever the page reports a render, so the transparency
+    // hole recomposites over the freshly-painted WebView. Cancelled when dropped.
+    #[cfg(target_os = "macos")]
+    _render_task: Task<()>,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -809,7 +815,21 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         let errors = Rc::new(RefCell::new(Vec::new()));
         #[cfg(target_os = "macos")]
-        let webview = attach_webview(window, document.clone(), errors.clone()).map(Rc::new);
+        let (render_tx, mut render_rx) = mpsc::unbounded::<()>();
+        #[cfg(target_os = "macos")]
+        let webview =
+            attach_webview(window, document.clone(), errors.clone(), render_tx).map(Rc::new);
+        // Redraw the view on every page-render signal. The first signal arrives
+        // once the WebView has actually painted, which recomposites the
+        // transparency hole over real content instead of a black, unpainted view.
+        #[cfg(target_os = "macos")]
+        let render_task = cx.spawn(async move |this, cx| {
+            while render_rx.next().await.is_some() {
+                if this.update(cx, |_this, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        });
         #[cfg(target_os = "macos")]
         let theme_subscription =
             cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
@@ -833,6 +853,8 @@ impl CanvasView {
             _theme_subscription: theme_subscription,
             #[cfg(target_os = "macos")]
             errors,
+            #[cfg(target_os = "macos")]
+            _render_task: render_task,
             _watch_task: watch_task,
         }
     }
@@ -1216,6 +1238,7 @@ fn attach_webview(
     window: &Window,
     document: Rc<RefCell<String>>,
     errors: Rc<RefCell<Vec<String>>>,
+    render_signal: mpsc::UnboundedSender<()>,
 ) -> Option<wry::WebView> {
     use std::borrow::Cow;
     use wry::WebViewBuilder;
@@ -1260,7 +1283,10 @@ fn attach_webview(
     };
 
     // The page reports its render error state over IPC after each (re)render; we
-    // store it so the `canvas_errors` tool can report it back to the agent.
+    // store it so the `canvas_errors` tool can report it back to the agent, and
+    // signal the view so it recomposites the transparency hole now that the
+    // WebView has painted (otherwise the first frame after open can show through
+    // to an unpainted, black WebView until something else forces a redraw).
     let ipc_errors = errors;
     let ipc_handler = move |request: wry::http::Request<String>| {
         let body = request.body();
@@ -1268,6 +1294,9 @@ fn attach_webview(
             Ok(report) => *ipc_errors.borrow_mut() = report.errors,
             Err(err) => log::error!("canvas: bad IPC error report: {err}"),
         }
+        // Failure means the receiving view was dropped (canvas closed); nothing
+        // left to redraw, so ignoring it is correct.
+        render_signal.unbounded_send(()).ok();
     };
 
     match WebViewBuilder::new_as_child(&parent)
