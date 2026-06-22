@@ -13,12 +13,13 @@ Base: `origin/main`
   (monitor + retrieve completed `output`), `message_subagent` (queue a follow-up for a
   running subagent, or resume a finished one), `await_subagent` (blocking join with
   optional timeout), and `cancel_subagent`. All enabled in the `write`/`ask` profiles.
-- [x] **Phase 3.3 (auto-pull-when-idle)** — when the primary goes idle with background
-  subagents that finished but weren't surfaced, the agent starts a turn delivering their
-  results (via the `send_existing` + `handle_thread_events` self-prompt path), then they
-  are archived. Triggered by a `BackgroundSubagentsUpdated` event emitted on subagent
-  completion and at each turn boundary; gated on idle + no queued user message + not a
-  subagent thread, so it never interrupts an active exchange.
+- [x] **Phase 3.3 (auto-pull-when-idle) — REMOVED.** This feature (the primary
+  starting a self-prompt turn with an "[Automatic update]" message to surface finished
+  background subagents) was removed at the user's request. The agent now only pulls
+  subagent results explicitly via `list_subagents`/`await_subagent`. Subagent cards and
+  transcripts remain expandable/full-screenable and persist across restart; nothing
+  auto-injects a message into the conversation. (`BackgroundSubagentsUpdated` is still
+  emitted on status change to drive live card re-render, but no longer triggers a turn.)
 - [x] **Phase 6 (cancellation split)** — deterministic lifecycle (option A, matching
   Cursor): background subagents keep running across new user messages and are never
   cancelled by a parent-turn cancel. Root-cause fix: background subagents no longer
@@ -99,8 +100,6 @@ cargo test -p agent --manifest-path .worktrees/multitask-subagents/Cargo.toml su
 - `test_background_subagent_runs_without_blocking_parent`
 - `test_parent_turn_cancel_preserves_background_subagent`
 - `test_list_subagents_tool_during_turn_does_not_panic`
-- `test_new_turn_archives_finished_background_subagents`
-- `test_auto_pull_delivers_finished_subagent_when_idle`
 - plus all pre-existing subagent tests (27 total, passing).
 
 > Known minor gap: live model/profile/thinking setting changes propagate to

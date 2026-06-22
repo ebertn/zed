@@ -2805,10 +2805,7 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, cx| {
-                    this.running_turn.take();
-                    cx.emit(BackgroundSubagentsUpdated);
-                });
+                _ = this.update(cx, |this, _| this.running_turn.take());
             }
         });
         self.running_turn = Some(RunningTurn::new(
@@ -2915,13 +2912,7 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, cx| {
-                    this.running_turn.take();
-                    // Now that the turn is over, give the agent a chance to
-                    // surface any background subagents that finished while the
-                    // turn was running (auto-pull-when-idle).
-                    cx.emit(BackgroundSubagentsUpdated);
-                });
+                _ = this.update(cx, |this, _| this.running_turn.take());
             }
         });
         self.running_turn = Some(RunningTurn::new(event_stream, tools, cancellation_tx, task));
@@ -4474,52 +4465,6 @@ impl Thread {
             None
         } else {
             Some(subagent.pending_messages.remove(0))
-        }
-    }
-
-    /// If the primary thread is idle (no running turn, no queued user message)
-    /// and this is not itself a subagent, returns a summary of background
-    /// subagents that finished but haven't been surfaced yet, marking them as
-    /// delivered. Returns `None` otherwise. Used for auto-pull-when-idle.
-    pub(crate) fn auto_pull_summary_if_idle(&mut self) -> Option<String> {
-        if self.running_turn.is_some()
-            || self.has_queued_message
-            || self.subagent_context.is_some()
-        {
-            return None;
-        }
-        self.take_undelivered_completed_summary()
-    }
-
-    /// Builds a summary of finished-but-undelivered background subagents and
-    /// marks them delivered. Returns `None` if there are none.
-    fn take_undelivered_completed_summary(&mut self) -> Option<String> {
-        let mut sections = Vec::new();
-        for subagent in self.background_subagents.values_mut() {
-            if !subagent.status.is_terminal() || subagent.delivered {
-                continue;
-            }
-            subagent.delivered = true;
-            let detail = match &subagent.status {
-                SubagentStatus::Completed { output } => format!("completed:\n{output}"),
-                SubagentStatus::Failed { error } => format!("failed: {error}"),
-                SubagentStatus::Cancelled => "was cancelled.".to_string(),
-                SubagentStatus::Running => continue,
-            };
-            sections.push(format!(
-                "### {} (session {})\n{}",
-                subagent.label, subagent.session_id, detail
-            ));
-        }
-        if sections.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "[Automatic update] The following background sub-agent(s) finished while you \
-                 were idle. Review their results and continue the work, or report back to the \
-                 user:\n\n{}",
-                sections.join("\n\n")
-            ))
         }
     }
 

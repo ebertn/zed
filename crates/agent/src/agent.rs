@@ -1352,48 +1352,6 @@ impl NativeAgent {
                 acp_thread.refresh_subagent_tool_calls(cx);
             });
         }
-        self.deliver_completed_background_subagents(session_id, cx);
-    }
-
-    /// Auto-pull-when-idle: if the primary thread for `session_id` is idle and
-    /// has background subagents that finished but haven't been surfaced yet,
-    /// start a turn that delivers their results so the agent can react. Routes
-    /// the turn's events to the ACP thread exactly like a user-initiated prompt.
-    fn deliver_completed_background_subagents(
-        &mut self,
-        session_id: acp::SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.sessions.get(&session_id) else {
-            return;
-        };
-        let thread = session.thread.clone();
-        let acp_thread = session.acp_thread.clone();
-
-        let summary = thread.update(cx, |thread, _cx| thread.auto_pull_summary_if_idle());
-        let Some(summary) = summary else {
-            return;
-        };
-
-        let response_stream = thread.update(cx, |thread, cx| {
-            thread.send(UserMessageId::new(), [summary.as_str()], cx)
-        });
-        let response_stream = match response_stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                log::error!("Failed to deliver background subagent results: {error}");
-                return;
-            }
-        };
-
-        let connection = Some(NativeAgentConnection(cx.entity()));
-        NativeAgentConnection::handle_thread_events(
-            response_stream,
-            acp_thread.downgrade(),
-            connection,
-            cx,
-        )
-        .detach();
     }
 
     fn handle_project_event(
