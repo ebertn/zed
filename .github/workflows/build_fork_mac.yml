@@ -83,17 +83,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="build-latest"
           SHORT_SHA="${GITHUB_SHA:0:7}"
-          # Replace any previous rolling release (and its tag) so the download
-          # URL stays stable at .../releases/download/build-latest/Zed-aarch64.dmg
-          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          # Use a unique tag per build so every successful build is kept as its
+          # own release instead of overwriting a single rolling one. The run
+          # number keeps tags unique and ordered even across rebuilds of the
+          # same commit.
+          TAG="build-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Latest build ($SHORT_SHA)" \
+            --title "Build #${GITHUB_RUN_NUMBER} - ${SHORT_SHA} (${BUILD_DATE})" \
             --prerelease \
-            --notes "Automated production build of the \`build\` branch (commit $SHORT_SHA).
+            --notes "Automated production build of the \`build\` branch (commit $SHORT_SHA), built ${BUILD_DATE}.
 
           Ad-hoc signed (no Apple Developer certificate). After mounting the DMG and copying \`Zed Dev.app\` to /Applications, clear the quarantine flag so Gatekeeper allows it:
 
