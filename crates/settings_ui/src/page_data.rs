@@ -8149,6 +8149,52 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Background Sub-Agents",
+                description: "Whether the agent can spawn sub-agents that run in the background.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.background_subagents_enabled"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .background_subagents_enabled
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .background_subagents_enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Max Concurrent Background Sub-Agents",
+                description: "The maximum number of background sub-agents that may run at the same time. Spawning more than this returns an error until one finishes.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.max_concurrent_background_subagents"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .max_concurrent_background_subagents
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .max_concurrent_background_subagents = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Use Modifier To Send",
                 description: "Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages.",
                 field: Box::new(SettingField {
