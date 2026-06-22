@@ -159,7 +159,12 @@ fn register_canvas(view: &Entity<CanvasView>, window: AnyWindowHandle, cx: &mut 
         .release_subscriptions
         .insert(id, subscription);
 
-    refresh_window_transparency(window, cx);
+    // `open` calls this while still holding `&mut Window` for this window, so the
+    // window is checked out of `cx` and a synchronous `window.update` here fails
+    // with "window not found" (leaving the surface opaque, which hides the
+    // WebView behind the transparency hole). Defer so the refresh runs once the
+    // window borrow has been released and the handle resolves again.
+    cx.defer(move |cx| refresh_window_transparency(window, cx));
     id
 }
 
@@ -1233,6 +1238,12 @@ fn attach_webview(
     match WebViewBuilder::new_as_child(&parent)
         .with_bounds(initial)
         .with_devtools(false)
+        // The canvas is a display surface: it should receive mouse events (scroll,
+        // text selection) but never steal keyboard focus from Zed. wry focuses the
+        // WebView on creation by default, which makes its content view the window's
+        // first responder once the page loads, so keystrokes go to the WebView and
+        // Zed beeps. Opt out so keyboard focus stays with GPUI.
+        .with_focused(false)
         .with_initialization_script(
             "window.addEventListener('contextmenu', function (e) { e.preventDefault(); }, true);",
         )
