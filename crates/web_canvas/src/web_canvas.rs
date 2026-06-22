@@ -15,7 +15,7 @@ use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     SharedString, Styled as _, Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance,
-    actions, canvas, div, point, px, size,
+    canvas, div, point, px, size,
 };
 use workspace::{Item, Workspace};
 
@@ -36,46 +36,11 @@ use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimpl
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, rc::Rc};
 
-actions!(
-    canvas,
-    [
-        /// Opens a "Canvas" tab backed by a native WebView in the active pane.
-        OpenCanvasSpike,
-        /// Brings the next open canvas to the foreground (cycles through them).
-        FocusNextCanvas,
-    ]
-);
-
 pub fn init(cx: &mut App) {
     surface::register_surface_provider(cx, Arc::new(CanvasProvider));
     surface::load_persisted(cx);
 
-    cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        workspace.register_action(|workspace, _: &OpenCanvasSpike, window, cx| {
-            let path = match prepare_canvas_file("Canvas Spike", DEFAULT_CANVAS, true) {
-                Ok(path) => path,
-                Err(err) => {
-                    log::error!("canvas: {err:#}");
-                    return;
-                }
-            };
-            let params =
-                serde_json::json!({ "title": "Canvas Spike", "path": path.to_string_lossy() });
-            if let Err(err) = surface::open_surface("canvas", params, workspace, window, cx) {
-                log::error!("canvas: open_surface failed: {err:#}");
-            }
-            workspace
-                .project()
-                .update(cx, |project, cx| {
-                    project.find_or_create_worktree(canvases_dir(), false, cx)
-                })
-                .detach();
-        });
-
-        workspace.register_action(|workspace, _: &FocusNextCanvas, window, cx| {
-            focus_next_canvas(workspace, window, cx);
-        });
-
+    cx.observe_new(|_workspace: &mut Workspace, window, cx| {
         // Remember this workspace + its window so agent tools (which only get an
         // `&mut App`) can open canvases into the workspace the user is in. For a
         // single-window setup this is exactly "the active workspace".
@@ -349,10 +314,10 @@ fn slugify(title: &str) -> String {
 /// `~/.agents/canvases/<slug>.canvas.tsx` exists, writing `default_content` only
 /// if the file is new (an existing canvas with the same title is left intact so
 /// it can be reopened by identifier). Returns the file path.
-fn prepare_canvas_file(title: &str, default_content: &str, overwrite: bool) -> Result<PathBuf> {
+fn prepare_canvas_file(title: &str, default_content: &str) -> Result<PathBuf> {
     scaffold_canvas_project();
     let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(title)));
-    if overwrite || !path.exists() {
+    if !path.exists() {
         std::fs::write(&path, default_content)
             .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))?;
     }
@@ -436,36 +401,9 @@ fn focus_canvas(id: u64, cx: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Cycles to the next open canvas (by id, wrapping) and activates it. Driven by
-/// the `canvas: focus next canvas` action so canvases can be navigated without
-/// relying on the tab bar.
-fn focus_next_canvas(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let canvases = live_canvases(cx);
-    if canvases.is_empty() {
-        return;
-    }
-    let last_focused = cx
-        .try_global::<CanvasRegistry>()
-        .and_then(|registry| registry.last_focused);
-    let next_id = match last_focused {
-        Some(last) => canvases
-            .iter()
-            .map(|(id, _)| *id)
-            .find(|id| *id > last)
-            .or_else(|| canvases.first().map(|(id, _)| *id)),
-        None => canvases.first().map(|(id, _)| *id),
-    };
-    let Some(next_id) = next_id else {
-        return;
-    };
-    let Some(view) = canvas_by_id(next_id, cx) else {
-        return;
-    };
-    workspace.activate_item(&view, true, true, window, cx);
-    if cx.has_global::<CanvasRegistry>() {
-        cx.global_mut::<CanvasRegistry>().last_focused = Some(next_id);
-    }
-}
+
+
+
 
 fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
     cx.has_global::<G>().then(|| cx.global_mut::<G>())
@@ -561,7 +499,7 @@ impl AgentTool for CanvasOpenTool {
             let input = input.recv().await.map_err(|err| err.to_string())?;
             // Create a starter file only if this canvas doesn't exist yet; an
             // existing canvas with the same title is reopened as-is.
-            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title), false)
+            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title))
                 .map_err(|err| err.to_string())?;
             // Make the canvases dir a (non-visible) worktree so `edit_file` and the
             // language server work on the file before the agent edits it.
@@ -1483,70 +1421,6 @@ fn hsl_triplet(color: gpui::Hsla) -> String {
     let l = (color.l.clamp(0.0, 1.0) * 100.0).round();
     format!("{h} {s}% {l}%")
 }
-
-/// Default canvas shown by the `canvas: open canvas spike` action; also a
-/// reference for the component API.
-const DEFAULT_CANVAS: &str = r##"
-function Canvas() {
-  const { kind, name, colors } = useHostTheme();
-  const data = [
-    { name: "Jul", revenue: 30 },
-    { name: "Aug", revenue: 42 },
-    { name: "Sep", revenue: 51 },
-    { name: "Oct", revenue: 49 },
-  ];
-  return (
-    <Page>
-      <h1>Canvas runtime is live</h1>
-      <p>
-        Rendered with React, shadcn/ui components, Recharts, and Tailwind — all
-        bundled offline. Host theme: <strong>{name || kind}</strong> ({kind}).
-      </p>
-      <Grid cols={3}>
-        <Card>
-          <CardHeader><CardDescription>Revenue</CardDescription><CardTitle>$48.2k</CardTitle></CardHeader>
-          <CardContent><Badge>+12%</Badge></CardContent>
-        </Card>
-        <Card>
-          <CardHeader><CardDescription>Active users</CardDescription><CardTitle>1,284</CardTitle></CardHeader>
-          <CardContent><Badge variant="secondary">-3%</Badge></CardContent>
-        </Card>
-        <Card>
-          <CardHeader><CardDescription>NPS</CardDescription><CardTitle>62</CardTitle></CardHeader>
-          <CardContent><Badge variant="outline">stable</Badge></CardContent>
-        </Card>
-      </Grid>
-      <h2>Revenue</h2>
-      <div className="not-prose" style={{ width: "100%", height: 240 }}>
-        <ResponsiveContainer>
-          <BarChart data={data}>
-            <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
-            <XAxis dataKey="name" stroke="hsl(var(--muted-foreground))" />
-            <YAxis stroke="hsl(var(--muted-foreground))" />
-            <Tooltip />
-            <Bar dataKey="revenue" fill="hsl(var(--primary))" radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-      <h2>Breakdown</h2>
-      <Table>
-        <TableHeader>
-          <TableRow><TableHead>Item</TableHead><TableHead className="text-right">Count</TableHead></TableRow>
-        </TableHeader>
-        <TableBody>
-          <TableRow><TableCell>Alpha</TableCell><TableCell className="text-right">12</TableCell></TableRow>
-          <TableRow><TableCell>Beta</TableCell><TableCell className="text-right">34</TableCell></TableRow>
-          <TableRow><TableCell>Gamma</TableCell><TableCell className="text-right">7</TableCell></TableRow>
-        </TableBody>
-      </Table>
-      <Row gap={3}>
-        <Button>Primary</Button>
-        <Button variant="outline">Secondary</Button>
-      </Row>
-    </Page>
-  );
-}
-"##;
 
 /// The esbuild-built canvas SDK bundle (React + ReactDOM + the component
 /// library), served to the page at `zedcanvas://localhost/sdk.js`. Rebuild it
