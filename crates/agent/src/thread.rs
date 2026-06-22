@@ -1951,7 +1951,9 @@ impl Thread {
                             label: subagent.label.into(),
                             status,
                             thread: None,
-                            delivered: subagent.delivered,
+                            // Already handled in a previous session; never
+                            // auto-surface restored subagents after a restart.
+                            delivered: true,
                             pending_messages: Vec::new(),
                             driver: None,
                         },

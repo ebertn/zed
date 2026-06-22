@@ -1166,6 +1166,22 @@ impl ConversationView {
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
                         let root_session_id = thread.read(cx).session_id().clone();
 
+                        // Subagent sessions referenced by this thread's tool
+                        // calls, so we can reopen them after a restart and
+                        // restore their cards (transcript / expand / full-screen).
+                        let subagent_session_ids: Vec<acp::SessionId> = thread
+                            .read(cx)
+                            .entries()
+                            .iter()
+                            .filter_map(|entry| match entry {
+                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => tool_call
+                                    .subagent_session_info
+                                    .as_ref()
+                                    .map(|info| info.session_id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+
                         let conversation = cx.new(|cx| {
                             let mut conversation = Conversation::default();
                             conversation.register_thread(thread.clone(), cx);
@@ -1197,13 +1213,24 @@ impl ConversationView {
                                 connection,
                                 auth_state: AuthState::Ok,
                                 active_id: Some(root_session_id.clone()),
-                                threads: HashMap::from_iter([(root_session_id, current)]),
+                                threads: HashMap::from_iter([(root_session_id.clone(), current)]),
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                                 _request_elicitation_subscription: request_elicitation_subscription,
                             }),
                             cx,
                         );
+
+                        // Reopen the subagent sessions so their tool-call cards
+                        // are fully functional again after a restart.
+                        for subagent_session_id in subagent_session_ids {
+                            this.load_subagent_session(
+                                subagent_session_id,
+                                root_session_id.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                     }
                     Err(err) => {
                         this.handle_load_error(
