@@ -644,6 +644,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Sets rectangular regions (in window logical coordinates, top-left origin)
+    /// where native mouse hit-testing passes through this window's rendering
+    /// surface to a view layered behind it. Used by embedded native views (e.g.
+    /// a `WebView`) so they receive mouse events through a punched-out
+    /// transparent region. Default is a no-op (no passthrough).
+    fn set_mouse_passthrough_rects(&self, _rects: Vec<Bounds<Pixels>>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

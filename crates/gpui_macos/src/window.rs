@@ -153,6 +153,10 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
+                sel!(hitTest:),
+                hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.add_method(
                 sel!(mouseUp:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -523,6 +527,10 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // Rectangular regions (window logical coords, top-left origin) where
+    // `hitTest:` returns nil so native mouse events pass through to a sibling
+    // view layered behind the Metal view (e.g. an embedded WebView).
+    mouse_passthrough_rects: Vec<Bounds<Pixels>>,
 }
 
 impl MacWindowState {
@@ -912,6 +920,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                mouse_passthrough_rects: Vec::new(),
             })));
 
             (*native_window).set_ivar(
@@ -1541,6 +1550,10 @@ impl PlatformWindow for MacWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.0.as_ref().lock().background_appearance
+    }
+
+    fn set_mouse_passthrough_rects(&self, rects: Vec<Bounds<Pixels>>) {
+        self.0.as_ref().lock().mouse_passthrough_rects = rects;
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2216,6 +2229,36 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         }
 
         _ => NO,
+    }
+}
+
+/// Returns `nil` when `point` falls in a registered mouse-passthrough region so
+/// AppKit routes the event to a sibling view layered behind this one (an
+/// embedded WebView showing through a transparent canvas region); otherwise
+/// falls back to the default `NSView` hit test.
+extern "C" fn hit_test(this: &Object, _: Sel, location: NSPoint) -> id {
+    let window_state = unsafe { get_window_state(this) };
+    // `location` is in the superview (contentView) coordinate system, which
+    // matches the GPUI window origin. AppKit uses a bottom-left origin while
+    // GPUI uses top-left, so flip Y against the content height.
+    let passthrough = window_state
+        .try_lock()
+        .map(|lock| {
+            if lock.mouse_passthrough_rects.is_empty() {
+                return false;
+            }
+            let height = lock.content_size().height;
+            let gpui_point = point(px(location.x as f32), height - px(location.y as f32));
+            lock.mouse_passthrough_rects
+                .iter()
+                .any(|rect| rect.contains(&gpui_point))
+        })
+        .unwrap_or(false);
+
+    if passthrough {
+        nil
+    } else {
+        unsafe { msg_send![super(this, class!(NSView)), hitTest: location] }
     }
 }
 

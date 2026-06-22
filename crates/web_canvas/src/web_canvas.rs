@@ -837,11 +837,14 @@ impl CanvasView {
         }
         self.mode = mode;
         #[cfg(target_os = "macos")]
-        if mode == CanvasMode::Code
-            && let Some(webview) = self.webview.as_ref()
-            && let Err(err) = webview.set_visible(false)
-        {
-            log::error!("canvas: set_visible(false) failed: {err}");
+        if mode == CanvasMode::Code {
+            if let Some(webview) = self.webview.as_ref()
+                && let Err(err) = webview.set_visible(false)
+            {
+                log::error!("canvas: set_visible(false) failed: {err}");
+            }
+            // The code editor is opaque GPUI; stop passing mouse events through.
+            window.set_mouse_passthrough_rects(Vec::new());
         }
         if mode == CanvasMode::Code && self.code_editor.is_none() {
             self.load_code_editor(window, cx);
@@ -897,43 +900,57 @@ impl CanvasView {
 
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = div().track_focus(&self.focus_handle).size_full().relative();
-
-        let root = match self.mode {
-            // Paint a transparency hole rather than a solid background: this
-            // clears the window's surface to alpha 0 over the canvas rect so the
-            // WebView (layered behind GPUI's Metal view) shows through, while
-            // GPUI overlays (this toggle, context menus) composite on top. See
-            // `attach_webview`.
-            CanvasMode::Rendered => {
-                let root = root.bg(gpui::transparency_hole());
-                // On macOS, overlay a `canvas()` element that reports its bounds
-                // each frame so we keep the native WebView aligned with the tab.
-                #[cfg(target_os = "macos")]
-                let root = {
-                    let webview = self.webview.clone();
-                    root.child(
-                        canvas(
-                            |_bounds, _window, _cx| {},
-                            move |bounds: Bounds<Pixels>, _, _window, _cx| {
-                                position_webview(webview.as_ref(), bounds);
-                            },
-                        )
-                        .size_full(),
-                    )
-                };
-                root
-            }
-            CanvasMode::Code => root.child(self.render_code_view(cx)),
+        let content = match self.mode {
+            CanvasMode::Rendered => self.render_canvas_content(cx),
+            CanvasMode::Code => self.render_code_view(cx).into_any_element(),
         };
 
-        root.child(self.render_mode_toggle(cx))
+        // A top toolbar strip holds the Canvas/Code toggle. It is opaque and
+        // sits outside the transparency hole, so its clicks reach GPUI (the hole
+        // region passes mouse events through to the WebView; see
+        // `render_canvas_content`).
+        div()
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(self.render_toolbar(cx))
+            .child(div().flex_1().relative().child(content))
     }
 }
 
 impl CanvasView {
-    /// The floating Canvas/Code toggle, anchored top-right over the content.
-    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The rendered-canvas content: a transparency hole that the native WebView
+    /// shows through. The `canvas()` painter keeps the WebView aligned with the
+    /// hole and registers the hole as a native mouse-passthrough region so the
+    /// WebView receives scroll/selection/click events.
+    fn render_canvas_content(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+        #[cfg(target_os = "macos")]
+        {
+            let webview = self.webview.clone();
+            div()
+                .size_full()
+                .bg(gpui::transparency_hole())
+                .child(
+                    canvas(
+                        |_bounds, _window, _cx| {},
+                        move |bounds: Bounds<Pixels>, _, window, _cx| {
+                            position_webview(webview.as_ref(), bounds);
+                            window.set_mouse_passthrough_rects(vec![bounds]);
+                        },
+                    )
+                    .size_full(),
+                )
+                .into_any_element()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            div().size_full().into_any_element()
+        }
+    }
+
+    /// The opaque top strip containing the Canvas/Code toggle.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use theme::ActiveTheme as _;
 
         let view = cx.entity();
@@ -961,11 +978,16 @@ impl CanvasView {
         .auto_width();
 
         div()
-            .absolute()
-            .top_2()
-            .right_2()
-            .rounded_md()
+            .flex()
+            .flex_row()
+            .w_full()
+            .items_center()
+            .justify_end()
+            .px_2()
+            .py_1()
             .bg(cx.theme().colors().elevated_surface_background)
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(toggle)
     }
 
@@ -1002,7 +1024,7 @@ impl Item for CanvasView {
         self.title.clone()
     }
 
-    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn deactivated(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         // The WebView is a window-level sibling view, so it does not disappear on
         // its own when another tab becomes active; hide it explicitly. It is shown
         // again by `position_webview` the next time this tab paints.
@@ -1012,6 +1034,9 @@ impl Item for CanvasView {
         {
             log::error!("canvas: set_visible(false) failed: {err}");
         }
+        // Stop passing mouse events through to the (now hidden) WebView region,
+        // so the tab that replaces this one receives events normally.
+        window.set_mouse_passthrough_rects(Vec::new());
     }
 }
 
