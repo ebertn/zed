@@ -234,6 +234,8 @@ pub struct AgentSettings {
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
+    pub background_subagents_enabled: bool,
+    pub max_concurrent_background_subagents: usize,
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
@@ -778,6 +780,10 @@ impl Settings for AgentSettings {
                 .filter(|command| !command.trim().is_empty()),
             thinking_display: agent.thinking_display.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
+            background_subagents_enabled: agent.background_subagents_enabled.unwrap(),
+            max_concurrent_background_subagents: agent
+                .max_concurrent_background_subagents
+                .unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),

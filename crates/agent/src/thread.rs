@@ -3940,6 +3940,15 @@ impl Thread {
                 }
             })
             .filter(|(tool_name, _)| crate::tools::tool_feature_flag_enabled(tool_name, cx))
+            .filter(|(tool_name, _)| {
+                // The master switch for background subagents hides the whole
+                // tool family when disabled.
+                if crate::tools::is_background_subagent_tool(tool_name) {
+                    AgentSettings::get_global(cx).background_subagents_enabled
+                } else {
+                    true
+                }
+            })
             .collect::<BTreeMap<_, _>>();
 
         let mut context_server_tools = Vec::new();
