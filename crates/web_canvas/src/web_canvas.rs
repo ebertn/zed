@@ -486,20 +486,27 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 ///   only JSX is transpiled.
 ///
 /// Components available as globals (no import needed):
-/// - `<Page>…</Page>`: root wrapper with readable typography (Tailwind `prose`).
-///   Put prose elements (h1/h2/p/ul/ol/blockquote/code/strong/em) directly inside
-///   and they are styled for reading automatically.
-/// - `<Card title="…">…</Card>`
-/// - `<Stat label="…" value="…" delta="…" tone="up|down" />`
-/// - `<Grid cols={n}>…</Grid>`, `<Stack gap={n}>…</Stack>`, `<Row gap={n}>…</Row>`
-/// - `<Table headers={[…]} rows={[[…], …]} align={["left"|"right", …]} />`
-/// - `<BarChart data={[{ label, value }, …]} />`
-/// - `<Button variant="primary" onClick={fn}>…</Button>`, `<Badge tone="success|danger">…</Badge>`
-/// - `useHostTheme()` -> `{ kind: "light" | "dark", name: string | null, colors: Record<string, string> }`
+/// - Layout/typography: `<Page>…</Page>` (centered, readable `prose`; put
+///   h1/h2/p/ul/blockquote/code directly inside), `<Grid cols={n}>`, `<Stack>`,
+///   `<Row>`.
+/// - shadcn/ui: `<Button variant="default|secondary|outline|destructive|ghost|link">`,
+///   `<Card>`/`<CardHeader>`/`<CardTitle>`/`<CardDescription>`/`<CardContent>`/`<CardFooter>`,
+///   `<Badge variant="default|secondary|destructive|outline">`,
+///   `<Table>`/`<TableHeader>`/`<TableBody>`/`<TableRow>`/`<TableHead>`/`<TableCell>`,
+///   `<Alert>`/`<AlertTitle>`/`<AlertDescription>`, `<Separator>`,
+///   `<Tabs>`/`<TabsList>`/`<TabsTrigger>`/`<TabsContent>`.
+/// - Charts (Recharts, exposed as globals): `<ResponsiveContainer>`, `<BarChart>`,
+///   `<Bar>`, `<LineChart>`, `<Line>`, `<AreaChart>`, `<Area>`, `<PieChart>`,
+///   `<Pie>`, `<Cell>`, `<XAxis>`, `<YAxis>`, `<CartesianGrid>`, `<Tooltip>`,
+///   `<Legend>` (also the full `Recharts` namespace). Wrap a chart in a sized
+///   `<div style={{ width: "100%", height: 240 }}>` with `<ResponsiveContainer>`.
+/// - Icons (lucide): e.g. `<TrendingUp />`, `<Check />`, `<Info />` (also the
+///   `Icons` namespace).
+/// - `useHostTheme()` -> `{ kind: "light" | "dark", name: string | null, colors: Record<string, string> }`.
+/// - `cn(...classes)` to compose Tailwind classes.
 ///
-/// You may also use Tailwind utility classes via `className="…"` for layout/color.
-/// Keep it clean and readable: neutral grays, a single accent color, no gradients
-/// or drop shadows.
+/// Style with shadcn/Tailwind token classes (`bg-card`, `text-muted-foreground`,
+/// `bg-primary`, `border`, etc.); they automatically follow the Zed theme.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasOpenToolInput {
     /// Short title shown on the canvas tab. Also identifies the canvas: opening
@@ -1122,11 +1129,23 @@ fn attach_webview(
         size: wry::dpi::LogicalSize::new(640.0, 480.0).into(),
     };
 
-    // Serve the document from a custom scheme so the page has a real origin. A
-    // `load_html` page is opaque-origin, which scrubs script errors to bare
-    // "Script error." and breaks the React/Babel runtime.
+    // Serve the document (and the embedded SDK bundle) from a custom scheme so
+    // the page has a real origin. A `load_html` page is opaque-origin, which
+    // scrubs script errors to bare "Script error." and breaks the runtime.
     let protocol_document = document;
-    let protocol = move |_request: wry::http::Request<Vec<u8>>| {
+    let protocol = move |request: wry::http::Request<Vec<u8>>| {
+        let asset: Option<(&str, &str)> = match request.uri().path() {
+            "/sdk.js" => Some(("text/javascript", CANVAS_SDK_JS)),
+            "/tailwind.js" => Some(("text/javascript", CANVAS_TAILWIND_JS)),
+            "/babel.js" => Some(("text/javascript", CANVAS_BABEL_JS)),
+            _ => None,
+        };
+        if let Some((content_type, body)) = asset {
+            return Response::builder()
+                .header(CONTENT_TYPE, content_type)
+                .body(Cow::Borrowed(body.as_bytes()))
+                .unwrap_or_else(|_| Response::new(Cow::Borrowed(&b""[..])));
+        }
         let html = protocol_document.borrow().clone().into_bytes();
         Response::builder()
             .header(CONTENT_TYPE, "text/html")
@@ -1313,6 +1332,29 @@ fn canvas_theme_json(cx: &App) -> String {
             "warning": css_color(status.warning),
             "success": css_color(status.success),
             "info": css_color(status.info),
+        },
+        // shadcn token theme as HSL triplets ("H S% L%"), consumed as
+        // `hsl(var(--name))` by the bundled shadcn components.
+        "vars": {
+            "background": hsl_triplet(colors.background),
+            "foreground": hsl_triplet(colors.text),
+            "card": hsl_triplet(colors.elevated_surface_background),
+            "card-foreground": hsl_triplet(colors.text),
+            "popover": hsl_triplet(colors.elevated_surface_background),
+            "popover-foreground": hsl_triplet(colors.text),
+            "primary": hsl_triplet(colors.text_accent),
+            "primary-foreground": hsl_triplet(colors.background),
+            "secondary": hsl_triplet(colors.element_background),
+            "secondary-foreground": hsl_triplet(colors.text),
+            "muted": hsl_triplet(colors.element_background),
+            "muted-foreground": hsl_triplet(colors.text_muted),
+            "accent": hsl_triplet(colors.element_background),
+            "accent-foreground": hsl_triplet(colors.text),
+            "destructive": hsl_triplet(status.error),
+            "destructive-foreground": hsl_triplet(colors.background),
+            "border": hsl_triplet(colors.border),
+            "input": hsl_triplet(colors.border),
+            "ring": hsl_triplet(colors.text_accent),
         }
     })
     .to_string()
@@ -1333,42 +1375,102 @@ fn css_color(color: gpui::Hsla) -> String {
     )
 }
 
+/// Formats a GPUI color as a shadcn-style HSL triplet, e.g. `"220 13% 18%"`,
+/// for use as `hsl(var(--token))`.
+fn hsl_triplet(color: gpui::Hsla) -> String {
+    let h = (color.h.clamp(0.0, 1.0) * 360.0).round();
+    let s = (color.s.clamp(0.0, 1.0) * 100.0).round();
+    let l = (color.l.clamp(0.0, 1.0) * 100.0).round();
+    format!("{h} {s}% {l}%")
+}
+
 /// Default canvas shown by the `canvas: open canvas spike` action; also a
 /// reference for the component API.
 const DEFAULT_CANVAS: &str = r##"
 function Canvas() {
   const { kind, name, colors } = useHostTheme();
+  const data = [
+    { name: "Jul", revenue: 30 },
+    { name: "Aug", revenue: 42 },
+    { name: "Sep", revenue: 51 },
+    { name: "Oct", revenue: 49 },
+  ];
   return (
     <Page>
       <h1>Canvas runtime is live</h1>
       <p>
-        This canvas is a React component rendered with Tailwind and the{" "}
-        <code>prose</code> typography plugin. Host theme:{" "}
-        <strong>{name || kind}</strong> ({kind}).
+        Rendered with React, shadcn/ui components, Recharts, and Tailwind — all
+        bundled offline. Host theme: <strong>{name || kind}</strong> ({kind}).
       </p>
       <Grid cols={3}>
-        <Card title="Revenue"><Stat label="This month" value="$48.2k" delta="+12%" tone="up" /></Card>
-        <Card title="Active users"><Stat label="Today" value="1,284" delta="-3%" tone="down" /></Card>
-        <Card title="NPS"><Stat label="Score" value="62" /></Card>
+        <Card>
+          <CardHeader><CardDescription>Revenue</CardDescription><CardTitle>$48.2k</CardTitle></CardHeader>
+          <CardContent><Badge>+12%</Badge></CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardDescription>Active users</CardDescription><CardTitle>1,284</CardTitle></CardHeader>
+          <CardContent><Badge variant="secondary">-3%</Badge></CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardDescription>NPS</CardDescription><CardTitle>62</CardTitle></CardHeader>
+          <CardContent><Badge variant="outline">stable</Badge></CardContent>
+        </Card>
       </Grid>
-      <h2>Sample bar chart</h2>
-      <BarChart data={[{label:"A",value:8},{label:"B",value:14},{label:"C",value:5},{label:"D",value:11}]} accent={colors.accent} />
-      <h2>Table</h2>
-      <Table headers={["Item","Count"]} rows={[["Alpha","12"],["Beta","34"],["Gamma","7"]]} align={["left","right"]} />
+      <h2>Revenue</h2>
+      <div className="not-prose" style={{ width: "100%", height: 240 }}>
+        <ResponsiveContainer>
+          <BarChart data={data}>
+            <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+            <XAxis dataKey="name" stroke="hsl(var(--muted-foreground))" />
+            <YAxis stroke="hsl(var(--muted-foreground))" />
+            <Tooltip />
+            <Bar dataKey="revenue" fill="hsl(var(--primary))" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      <h2>Breakdown</h2>
+      <Table>
+        <TableHeader>
+          <TableRow><TableHead>Item</TableHead><TableHead className="text-right">Count</TableHead></TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRow><TableCell>Alpha</TableCell><TableCell className="text-right">12</TableCell></TableRow>
+          <TableRow><TableCell>Beta</TableCell><TableCell className="text-right">34</TableCell></TableRow>
+          <TableRow><TableCell>Gamma</TableCell><TableCell className="text-right">7</TableCell></TableRow>
+        </TableBody>
+      </Table>
       <Row gap={3}>
-        <Button variant="primary">Primary</Button>
-        <Button>Secondary</Button>
-        <Badge tone="success">ok</Badge>
+        <Button>Primary</Button>
+        <Button variant="outline">Secondary</Button>
       </Row>
     </Page>
   );
 }
 "##;
 
+/// The esbuild-built canvas SDK bundle (React + ReactDOM + the component
+/// library), served to the page at `zedcanvas://localhost/sdk.js`. Rebuild it
+/// with `npm run build` in `crates/web_canvas/sdk` after editing the SDK source.
+#[cfg(target_os = "macos")]
+const CANVAS_SDK_JS: &str = include_str!("../assets/canvas-sdk.js");
+
+/// Vendored Tailwind (Play CDN JIT engine) served at `zedcanvas://localhost/tailwind.js`,
+/// so canvases style themselves offline. Re-download with the `curl` in the SDK
+/// README if bumping versions.
+#[cfg(target_os = "macos")]
+const CANVAS_TAILWIND_JS: &str = include_str!("../assets/tailwind.js");
+
+/// Vendored `@babel/standalone` served at `zedcanvas://localhost/babel.js`, used
+/// to transpile the agent's JSX in-browser. (Stage 2 will move transpilation
+/// host-side and drop this.)
+#[cfg(target_os = "macos")]
+const CANVAS_BABEL_JS: &str = include_str!("../assets/babel.min.js");
+
 /// React + Tailwind (+ typography) + Babel runtime shell. `CANVAS_TITLE_PLACEHOLDER`
 /// and `// CANVAS_BODY_PLACEHOLDER` are substituted by [`canvas_document`]. The
-/// SDK components are defined here and exposed as globals; the user's canvas is
-/// transpiled in-browser by Babel and mounted as `<Canvas/>`.
+/// React runtime and component library come from the embedded SDK bundle
+/// (`/sdk.js`); the user's canvas is transpiled in-browser by Babel and mounted
+/// as `<Canvas/>`.
 const CANVAS_SHELL: &str = r####"<!doctype html>
 <html lang="en">
 <head>
@@ -1409,30 +1511,61 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
     var t = window.__zedTheme;
     if (!t) return;
     document.documentElement.classList.toggle('dark', t.kind === 'dark');
-    var colors = t.colors || {};
     var root = document.documentElement.style;
+    var colors = t.colors || {};
     for (var key in colors) {
       if (Object.prototype.hasOwnProperty.call(colors, key)) {
         root.setProperty('--zed-' + key, colors[key]);
       }
     }
+    // shadcn token variables (HSL triplets like "220 13% 18%").
+    var vars = t.vars || {};
+    for (var name in vars) {
+      if (Object.prototype.hasOwnProperty.call(vars, name)) {
+        root.setProperty('--' + name, vars[name]);
+      }
+    }
   })();
 </script>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-<script src="https://cdn.tailwindcss.com?plugins=typography"></script>
-<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="zedcanvas://localhost/tailwind.js"></script>
 <script>
+  // Tailwind config wired to the shadcn CSS-variable token theme. The variables
+  // themselves (`--background`, `--primary`, …) are set from the Zed theme by the
+  // bootstrap above.
   tailwind.config = {
     darkMode: 'class',
-    theme: { extend: { fontFamily: { serif: ['ETBembo', '"Palatino Linotype"', 'Palatino', 'Georgia', 'serif'] } } }
+    theme: {
+      extend: {
+        colors: {
+          border: 'hsl(var(--border))',
+          input: 'hsl(var(--input))',
+          ring: 'hsl(var(--ring))',
+          background: 'hsl(var(--background))',
+          foreground: 'hsl(var(--foreground))',
+          primary: { DEFAULT: 'hsl(var(--primary))', foreground: 'hsl(var(--primary-foreground))' },
+          secondary: { DEFAULT: 'hsl(var(--secondary))', foreground: 'hsl(var(--secondary-foreground))' },
+          destructive: { DEFAULT: 'hsl(var(--destructive))', foreground: 'hsl(var(--destructive-foreground))' },
+          muted: { DEFAULT: 'hsl(var(--muted))', foreground: 'hsl(var(--muted-foreground))' },
+          accent: { DEFAULT: 'hsl(var(--accent))', foreground: 'hsl(var(--accent-foreground))' },
+          popover: { DEFAULT: 'hsl(var(--popover))', foreground: 'hsl(var(--popover-foreground))' },
+          card: { DEFAULT: 'hsl(var(--card))', foreground: 'hsl(var(--card-foreground))' },
+        },
+        borderRadius: { lg: 'var(--radius)', md: 'calc(var(--radius) - 2px)', sm: 'calc(var(--radius) - 4px)' },
+        fontFamily: { serif: ['ETBembo', '"Palatino Linotype"', 'Palatino', 'Georgia', 'serif'] },
+      },
+    },
   };
 </script>
+<script src="zedcanvas://localhost/sdk.js"></script>
+<script src="zedcanvas://localhost/babel.js"></script>
 <style>
   html, body { margin: 0; height: 100%; }
-  /* Driven by the host theme via `--zed-*` variables (see the theme bootstrap),
-     with light defaults as a fallback when no host theme is present. */
-  body { background: var(--zed-background, #fffff8); color: var(--zed-text, #111111); }
+  :root { --radius: 0.5rem; }
+  /* Default border color to the shadcn token (mirrors shadcn's base layer). */
+  * { border-color: hsl(var(--border, 0 0% 85%)); }
+  /* Driven by the host theme via the shadcn `--background`/`--foreground` tokens
+     (set by the theme bootstrap), with light defaults as a fallback. */
+  body { background: hsl(var(--background, 60 100% 99%)); color: hsl(var(--foreground, 0 0% 7%)); }
   /* Make code / equation blocks theme-aware even outside `prose` (e.g. inside a
      Card), so agent-authored blocks follow the host theme automatically. */
   pre, code, kbd, samp { background: var(--zed-element, rgba(0, 0, 0, 0.06)); border-radius: 4px; }
@@ -1442,79 +1575,16 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
 <body class="font-serif">
 <div id="root" class="px-8 py-6"></div>
 
-<script type="text/plain" id="canvas-sdk">
-function cx() { return Array.prototype.slice.call(arguments).filter(Boolean).join(' '); }
-function useHostTheme() {
-  var t = (typeof window !== 'undefined' && window.__zedTheme) || null;
-  var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  return {
-    kind: t ? t.kind : (prefersDark ? 'dark' : 'light'),
-    name: t ? t.name : null,
-    colors: (t && t.colors) || {},
-  };
-}
-function Page({ children, prose = true, className }) {
-  return <div className={cx('mx-auto max-w-3xl', prose && 'prose dark:prose-invert prose-headings:font-serif', className)}>{children}</div>;
-}
-function Stack({ children, gap = 4, className }) { return <div className={cx('flex flex-col', 'gap-' + gap, className)}>{children}</div>; }
-function Row({ children, gap = 4, className }) { return <div className={cx('flex flex-row items-center flex-wrap', 'gap-' + gap, className)}>{children}</div>; }
-function Grid({ children, cols = 2, gap = 4, className }) { return <div className={cx('grid not-prose', 'grid-cols-' + cols, 'gap-' + gap, className)}>{children}</div>; }
-function Card({ title, children, className }) {
-  return <div className={cx('not-prose rounded-lg border border-black/10 dark:border-white/15 p-4', className)}>
-    {title ? <div className="text-sm font-medium text-black/60 dark:text-white/60 mb-2">{title}</div> : null}
-    {children}
-  </div>;
-}
-function Stat({ label, value, delta, tone }) {
-  const t = tone === 'up' ? 'text-emerald-600 dark:text-emerald-400' : tone === 'down' ? 'text-rose-600 dark:text-rose-400' : 'text-black/50 dark:text-white/50';
-  return <div className="not-prose">
-    <div className="text-sm text-black/60 dark:text-white/60">{label}</div>
-    <div className="text-3xl font-semibold tabular-nums">{value}</div>
-    {delta != null ? <div className={cx('text-sm', t)}>{delta}</div> : null}
-  </div>;
-}
-function Button({ children, onClick, variant }) {
-  const base = 'not-prose inline-flex items-center rounded-md border px-3 py-1.5 text-sm font-medium cursor-pointer';
-  const v = variant === 'primary' ? 'bg-black text-white border-black dark:bg-white dark:text-black' : 'border-black/15 dark:border-white/20 hover:bg-black/5 dark:hover:bg-white/10';
-  return <button className={cx(base, v)} onClick={onClick}>{children}</button>;
-}
-function Badge({ children, tone }) {
-  const t = tone === 'danger' ? 'bg-rose-500/15 text-rose-700 dark:text-rose-300' : tone === 'success' ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'bg-black/10 dark:bg-white/15';
-  return <span className={cx('not-prose inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium', t)}>{children}</span>;
-}
-function Table({ headers = [], rows = [], align = [] }) {
-  const a = (i) => align[i] === 'right' ? 'text-right tabular-nums' : 'text-left';
-  return <table className="not-prose w-full text-sm border-collapse">
-    <thead><tr className="border-b border-black/15 dark:border-white/20">
-      {headers.map((h, i) => <th key={i} className={cx('py-1 pr-4 font-medium text-black/60 dark:text-white/60', a(i))}>{h}</th>)}
-    </tr></thead>
-    <tbody>{rows.map((r, ri) => <tr key={ri} className="border-b border-black/5 dark:border-white/10">
-      {r.map((c, ci) => <td key={ci} className={cx('py-1 pr-4 align-top', a(ci))}>{c}</td>)}
-    </tr>)}</tbody>
-  </table>;
-}
-function BarChart({ data = [], height = 220, accent = '#e41a1c' }) {
-  const max = Math.max(1, ...data.map((d) => d.value));
-  const n = data.length || 1;
-  const bw = 100 / n;
-  return <svg className="not-prose w-full" viewBox="0 0 100 60" preserveAspectRatio="none" role="img" aria-label="bar chart" style={{ height: height }}>
-    {data.map((d, i) => {
-      const h = (d.value / max) * 50;
-      return <rect key={i} x={i * bw + bw * 0.15} y={54 - h} width={bw * 0.7} height={h} fill={i === 0 ? accent : '#9ca3af'} />;
-    })}
-  </svg>;
-}
-Object.assign(window, { cx, useHostTheme, Page, Stack, Row, Grid, Card, Stat, Button, Badge, Table, BarChart });
-</script>
-
 <script type="text/plain" id="canvas-body">
 // CANVAS_BODY_PLACEHOLDER
 </script>
 
 <script>
-  // Transpile the SDK + canvas with Babel's stable transform API and run them via
-  // indirect eval (global scope). We avoid Babel's transformScriptTags / dynamic
-  // <script> injection, which throws (appendChild) inside WKWebView.
+  // Transpile the agent's canvas with Babel's stable transform API and run it via
+  // indirect eval (global scope). The React runtime + component library come from
+  // the bundled SDK (sdk.js), which already populated the globals. We avoid
+  // Babel's transformScriptTags / dynamic <script> injection, which throws
+  // (appendChild) inside WKWebView.
   (function () {
     function fail(msg) {
       window.__canvasErrors.push(msg);
@@ -1526,9 +1596,8 @@ Object.assign(window, { cx, useHostTheme, Page, Stack, Row, Grid, Card, Stat, Bu
     }
     try {
       if (!window.Babel || !Babel.transform) { return fail('Babel.transform unavailable'); }
-      var sdk = document.getElementById('canvas-sdk').textContent;
+      if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') { return fail('Canvas SDK (sdk.js) failed to load'); }
       var body = document.getElementById('canvas-body').textContent;
-      (0, eval)(Babel.transform(sdk, { presets: ['react', 'typescript'], filename: 'sdk.tsx' }).code);
       (0, eval)(Babel.transform(body, { presets: ['react', 'typescript'], filename: 'canvas.tsx' }).code);
       var element = (typeof Canvas !== 'undefined')
         ? React.createElement(Canvas)
@@ -1629,35 +1698,75 @@ declare global {
     };
   }
   function useHostTheme(): HostTheme;
+  function cn(...args: any[]): string;
 
-  interface PageProps { children?: any; prose?: boolean; className?: string }
-  function Page(props: PageProps): JSX.Element;
+  // Layout / typography helpers.
+  function Page(props: any): JSX.Element;
+  function Stack(props: any): JSX.Element;
+  function Row(props: any): JSX.Element;
+  function Grid(props: any): JSX.Element;
 
-  interface FlexProps { children?: any; gap?: number; className?: string }
-  function Stack(props: FlexProps): JSX.Element;
-  function Row(props: FlexProps): JSX.Element;
+  // shadcn/ui components (props are loosely typed for authoring convenience).
+  const Button: any;
+  const Card: any;
+  const CardHeader: any;
+  const CardFooter: any;
+  const CardTitle: any;
+  const CardDescription: any;
+  const CardContent: any;
+  const Badge: any;
+  const Table: any;
+  const TableHeader: any;
+  const TableBody: any;
+  const TableFooter: any;
+  const TableHead: any;
+  const TableRow: any;
+  const TableCell: any;
+  const TableCaption: any;
+  const Alert: any;
+  const AlertTitle: any;
+  const AlertDescription: any;
+  const Separator: any;
+  const Tabs: any;
+  const TabsList: any;
+  const TabsTrigger: any;
+  const TabsContent: any;
 
-  interface GridProps { children?: any; cols?: number; gap?: number; className?: string }
-  function Grid(props: GridProps): JSX.Element;
+  // Recharts (also available under the `Recharts` namespace).
+  const Recharts: any;
+  const ResponsiveContainer: any;
+  const BarChart: any;
+  const Bar: any;
+  const LineChart: any;
+  const Line: any;
+  const AreaChart: any;
+  const Area: any;
+  const PieChart: any;
+  const Pie: any;
+  const Cell: any;
+  const XAxis: any;
+  const YAxis: any;
+  const CartesianGrid: any;
+  const Tooltip: any;
+  const Legend: any;
 
-  interface CardProps { title?: string; children?: any; className?: string }
-  function Card(props: CardProps): JSX.Element;
-
-  interface StatProps { label?: any; value?: any; delta?: any; tone?: "up" | "down" }
-  function Stat(props: StatProps): JSX.Element;
-
-  interface ButtonProps { children?: any; onClick?: () => void; variant?: "primary" }
-  function Button(props: ButtonProps): JSX.Element;
-
-  interface BadgeProps { children?: any; tone?: "success" | "danger" }
-  function Badge(props: BadgeProps): JSX.Element;
-
-  interface TableProps { headers?: any[]; rows?: any[][]; align?: ("left" | "right")[] }
-  function Table(props: TableProps): JSX.Element;
-
-  interface BarChartProps { data?: { label: string; value: number }[]; height?: number; accent?: string }
-  function BarChart(props: BarChartProps): JSX.Element;
-
-  function cx(...args: any[]): string;
+  // lucide icons (also available under the `Icons` namespace).
+  const Icons: any;
+  const Activity: any;
+  const AlertCircle: any;
+  const AlertTriangle: any;
+  const ArrowDownRight: any;
+  const ArrowUpRight: any;
+  const Check: any;
+  const CheckCircle2: any;
+  const ChevronRight: any;
+  const CircleDot: any;
+  const Info: any;
+  const Minus: any;
+  const Plus: any;
+  const TrendingDown: any;
+  const TrendingUp: any;
+  const X: any;
+  const XCircle: any;
 }
 "##;
