@@ -14,7 +14,8 @@
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Task, WeakEntity, Window, actions, canvas, div,
+    SharedString, Styled as _, Task, WeakEntity, Window, WindowBackgroundAppearance, actions,
+    canvas, div,
 };
 use workspace::{Item, Workspace};
 
@@ -687,10 +688,14 @@ impl CanvasView {
 
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Paint a transparency hole rather than a solid background: this clears
+        // the window's surface to alpha 0 over the canvas rect so the WebView
+        // (layered behind GPUI's Metal view) shows through, while GPUI overlays
+        // such as context menus still composite on top. See `attach_webview`.
         let root = div()
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(gpui::black());
+            .bg(gpui::transparency_hole());
 
         // On macOS, overlay a `canvas()` element that reports its bounds each
         // frame so we can keep the native WebView aligned with the tab.
@@ -806,7 +811,7 @@ fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry:
     // Serve the document from a custom scheme so the page has a real origin. A
     // `load_html` page is opaque-origin, which scrubs script errors to bare
     // "Script error." and breaks the React/Babel runtime.
-    let protocol_document = document.clone();
+    let protocol_document = document;
     let protocol = move |_request: wry::http::Request<Vec<u8>>| {
         let html = protocol_document.borrow().clone().into_bytes();
         Response::builder()
@@ -827,12 +832,65 @@ fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry:
     {
         Ok(webview) => {
             log::info!("canvas: WebView attached (custom protocol)");
+            // The WebView is a sibling of GPUI's Metal view under `contentView`.
+            // `new_as_child` stacks it *above* the Metal view, which would cover
+            // GPUI's menus and overlays. Instead, layer it *below* the Metal
+            // view and make the window's surface non-opaque, so the WebView only
+            // shows through where the canvas tab punches a transparency hole
+            // (see `CanvasView::render`); everything GPUI draws then composites
+            // on top.
+            window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+            order_webview_below_native_view(window);
             Some(webview)
         }
         Err(err) => {
             log::error!("canvas: failed to build WebView: {err:#}");
             None
         }
+    }
+}
+
+/// Raises GPUI's Metal `native_view` above its siblings under `contentView`,
+/// which leaves the just-attached WebView ordered below it. Re-adding an
+/// existing subview with `addSubview:positioned:relativeTo:` reorders it in
+/// place rather than duplicating it.
+#[cfg(target_os = "macos")]
+fn order_webview_below_native_view(window: &Window) {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // `NSWindowOrderingMode::NSWindowAbove`.
+    const NS_WINDOW_ABOVE: isize = 1;
+
+    let Ok(window_handle) = HasWindowHandle::window_handle(window) else {
+        log::error!("canvas: could not resolve window handle for reordering");
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = window_handle.as_raw() else {
+        return;
+    };
+    let native_view = handle.ns_view.as_ptr() as *mut Object;
+
+    // SAFETY: `native_view` is a live NSView owned by the GPUI window; `window`
+    // and `contentView` are standard AppKit accessors returning borrowed
+    // objects. `addSubview:positioned:relativeTo:` reorders the existing
+    // subview without changing ownership.
+    unsafe {
+        let ns_window: *mut Object = msg_send![native_view, window];
+        if ns_window.is_null() {
+            log::error!("canvas: native view has no window; cannot reorder");
+            return;
+        }
+        let content_view: *mut Object = msg_send![ns_window, contentView];
+        if content_view.is_null() {
+            return;
+        }
+        let _: () = msg_send![
+            content_view,
+            addSubview: native_view
+            positioned: NS_WINDOW_ABOVE
+            relativeTo: std::ptr::null_mut::<Object>()
+        ];
     }
 }
 
