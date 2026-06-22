@@ -54,9 +54,7 @@ pub fn init(cx: &mut App) {
     // model if the active agent profile lists it (`agent.profiles.*.tools` in
     // settings) — these three are enabled in the default `write`/`ask` profiles.
     cx.observe_new(|thread: &mut Thread, _window, _cx| {
-        thread.add_tool(CreateCanvasTool {
-            session_id: thread.id().clone(),
-        });
+        thread.add_tool(CreateCanvasTool);
         thread.add_tool(CanvasOpenTool {
             session_id: thread.id().clone(),
         });
@@ -435,15 +433,16 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 
 // --- Agent tools -------------------------------------------------------------
 
-/// Creates a canvas — a panel that renders a React component to present
-/// information to the user (reports, dashboards, summaries, charts) — and opens
-/// it already populated with `content`, so it never flashes empty. Use this for
-/// any new canvas. After it opens, call `canvas_errors` (with the returned id)
-/// to confirm it rendered; if it reports errors, fix them by editing the file
-/// with `edit_file` (it hot-reloads).
+/// Creates a new canvas file for `title` and prepares it for editing. It does
+/// NOT display anything yet — that is deliberate, so the canvas never appears
+/// empty. The workflow for a new canvas is:
+///   1. `create_canvas` with a `title` to create the file (returns its path),
+///   2. write the canvas into that file with `edit_file`,
+///   3. display it with `canvas_open` (same `title`),
+///   4. confirm it rendered with `canvas_errors`.
 ///
-/// `content` must define exactly one top-level `function Canvas() { ... }`
-/// returning the UI. IMPORTANT RULES for its contents:
+/// A canvas is exactly one top-level `function Canvas() { ... }` returning the
+/// UI. IMPORTANT RULES for the file's contents:
 /// - Do NOT use `import` or `export`, and do NOT write TypeScript type
 ///   annotations. React and the component library are provided as globals and
 ///   only JSX is transpiled.
@@ -476,19 +475,12 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 /// `bg-primary`, `border`, etc.); they automatically follow the Zed theme.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CreateCanvasToolInput {
-    /// Short title shown on the canvas tab. Also identifies the canvas: a later
-    /// `create_canvas` or `canvas_open` with the same title targets the same file.
+    /// Short title shown on the canvas tab. Also identifies the canvas: open it
+    /// later (after editing) with `canvas_open` using this same title.
     title: String,
-    /// The full canvas source: exactly one top-level `function Canvas() { ... }`
-    /// returning the UI (no `import`/`export`, no TypeScript type annotations).
-    content: String,
 }
 
-struct CreateCanvasTool {
-    /// The session that owns this tool instance, so the created canvas can be
-    /// associated with (and reopened from) the conversation.
-    session_id: acp::SessionId,
-}
+struct CreateCanvasTool;
 
 impl AgentTool for CreateCanvasTool {
     type Input = CreateCanvasToolInput;
@@ -517,64 +509,31 @@ impl AgentTool for CreateCanvasTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
-        let session_id = self.session_id.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|err| err.to_string())?;
-            if input.content.trim().is_empty() {
-                return Err("create_canvas requires non-empty `content` defining `function Canvas() { ... }`".to_string());
-            }
-            // Write the provided content before opening so the canvas renders
-            // populated from the first frame, rather than flashing the empty
-            // starter and being filled in afterward.
-            scaffold_canvas_project();
-            let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(&input.title)));
-            std::fs::write(&path, &input.content)
-                .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
-            // Make the canvases dir a (non-visible) worktree so `edit_file` and the
-            // language server work on the file for follow-up fixes.
-            ensure_canvas_worktree(cx).await.map_err(|err| err.to_string())?;
-            let path_string = path.to_string_lossy().to_string();
-            // A fresh open loads the new content from disk; an already-open canvas
-            // with this title must be reloaded explicitly to pick it up.
-            let already_open =
-                cx.update(|cx| live_canvas_id_for_path(&path, cx).is_some());
-            let id = cx
-                .update(|cx| open_or_focus_canvas(&input.title, &path, cx))
+            // Create the file (a starter the agent will overwrite) at the canonical
+            // path and scaffold the project (tsconfig, ambient types, worktree) so
+            // `edit_file` and the language server work on it. The canvas is NOT
+            // opened here: the agent writes the content first, then displays it
+            // with `canvas_open`, so it never appears empty.
+            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title))
                 .map_err(|err| err.to_string())?;
-            let title = input.title.clone();
-            let content = input.content.clone();
-            cx.update(|cx| {
-                if already_open
-                    && let Some(view) = canvas_by_id(id.0, cx)
-                {
-                    view.update(cx, |view, cx| view.set_content(&content, cx));
-                }
-                let params = serde_json::json!({ "title": &title, "path": &path_string });
-                surface::record_session_surface(
-                    surface::SessionKey::new(session_id.0.to_string()),
-                    "canvas",
-                    title,
-                    params,
-                    id,
-                    cx,
-                );
-            });
+            ensure_canvas_worktree(cx).await.map_err(|err| err.to_string())?;
             Ok(format!(
-                "Created and opened canvas \"{}\" (id {}) at `{}`, rendering your content. Call `canvas_errors` with id {} to confirm it rendered without errors; fix any reported errors by editing the file with `edit_file` (it hot-reloads).",
+                "Created canvas \"{}\" at `{}`. Write the canvas into that file with `edit_file` (exactly one top-level `function Canvas() {{ ... }}`), then call `canvas_open` with title \"{}\" to display it, then `canvas_errors` to confirm it rendered without errors.",
                 input.title,
-                id.0,
                 path.display(),
-                id.0
+                input.title
             ))
         })
     }
 }
 
-/// Reopens an existing canvas (one created earlier with `create_canvas`) by
-/// `title` — focusing its tab if it's already open, otherwise opening it from
-/// its file. For a brand-new canvas use `create_canvas` instead, so it renders
-/// populated rather than flashing an empty starter. Returns the canvas id; use
-/// it with `canvas_errors` to confirm the canvas rendered.
+/// Displays a canvas by `title` — focusing its tab if it's already open,
+/// otherwise opening it from its file and rendering it. The canvas should
+/// already have been created with `create_canvas` and authored with `edit_file`
+/// before you open it, so it renders populated. Returns the canvas id; use it
+/// with `canvas_errors` to confirm the canvas rendered.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasOpenToolInput {
     /// Short title shown on the canvas tab. Also identifies the canvas: opening
