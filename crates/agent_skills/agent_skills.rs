@@ -758,6 +758,14 @@ pub fn global_skills_dir() -> PathBuf {
         .join(SKILLS_DIR_NAME)
 }
 
+/// The global agent data directory (`~/.agents`). Skills live under
+/// `~/.agents/skills`; other agent-owned areas (e.g. `~/.agents/canvases`) live
+/// as siblings. Agent file tools treat this whole tree as an allowed
+/// outside-project location.
+pub fn global_agents_dir() -> PathBuf {
+    paths::home_dir().join(AGENTS_DIR_NAME)
+}
+
 /// Project-local skills live at this path relative to a worktree root,
 /// e.g. `<worktree>/.agents/skills/<skill>/SKILL.md`.
 pub fn project_skills_relative_path() -> &'static str {
