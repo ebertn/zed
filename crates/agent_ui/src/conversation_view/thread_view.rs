@@ -584,6 +584,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    pub canvases_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -965,6 +966,7 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            canvases_expanded: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -2858,6 +2860,7 @@ impl ThreadView {
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
+        let canvases_expanded = self.canvases_expanded;
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         // Drop shadows have no opaque surface to blend into on a transparent
@@ -2929,7 +2932,10 @@ impl ThreadView {
                                 || !changed_buffers.is_empty(),
                             |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                         )
-                        .child(self.render_canvases_summary(&canvases, cx))
+                        .child(self.render_canvases_summary(&canvases, canvases_expanded, cx))
+                        .when(canvases_expanded, |parent| {
+                            parent.child(self.render_canvas_rows(&canvases, cx))
+                        })
                     })
                     .when(!queue_is_empty, |this| {
                         this.when(
@@ -2948,23 +2954,26 @@ impl ThreadView {
             .into()
     }
 
-    /// A summary row for canvases this conversation created, each opening (or
-    /// reopening from disk) the canvas on click. See the `surface` crate.
+    /// The collapsible header row for canvases this conversation created. The
+    /// body ([`Self::render_canvas_rows`]) is rendered separately when expanded.
     fn render_canvases_summary(
         &self,
         canvases: &[surface::SurfaceInfo],
+        expanded: bool,
         cx: &Context<Self>,
     ) -> Div {
-        let session_key =
-            surface::SessionKey::new(self.thread.read(cx).session_id().0.to_string());
-
-        v_flex()
+        h_flex()
             .p_1()
-            .gap_0p5()
+            .justify_between()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
             .child(
                 h_flex()
-                    .px_1()
+                    .id("canvases-container")
+                    .cursor_pointer()
                     .gap_1()
+                    .child(Disclosure::new("canvases-disclosure", expanded))
                     .child(
                         Icon::new(IconName::Image)
                             .size(IconSize::Small)
@@ -2988,34 +2997,64 @@ impl ThreadView {
                         ))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
-                    ),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.canvases_expanded = !this.canvases_expanded;
+                        cx.notify();
+                    })),
             )
+    }
+
+    /// The expanded canvas list: one row per canvas, title on the far left and an
+    /// open icon on the far right, rows separated by horizontal dividers (like
+    /// the edited-files list). Clicking a row opens (or reopens) the canvas.
+    fn render_canvas_rows(
+        &self,
+        canvases: &[surface::SurfaceInfo],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let editor_bg_color = cx.theme().colors().editor_background;
+        let session_key =
+            surface::SessionKey::new(self.thread.read(cx).session_id().0.to_string());
+        let count = canvases.len();
+
+        v_flex()
+            .id("canvas-list")
+            .max_h_40()
+            .overflow_y_scroll()
             .children(canvases.iter().map(|canvas| {
                 let index = canvas.index;
                 let session_key = session_key.clone();
-                Button::new(
-                    SharedString::from(format!("open-canvas-{index}")),
-                    canvas.title.clone(),
-                )
-                .start_icon(
-                    Icon::new(IconName::Maximize)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .label_size(LabelSize::Small)
-                .full_width()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let session_key = session_key.clone();
-                    let workspace = this.workspace.clone();
-                    let result = workspace.update(cx, |workspace, cx| {
-                        surface::focus_surface(&session_key, index, workspace, window, cx)
-                    });
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => log::error!("canvas: failed to open: {err}"),
-                        Err(err) => log::error!("canvas: workspace unavailable: {err}"),
-                    }
-                }))
+                h_flex()
+                    .id(("canvas-row", index))
+                    .p_1p5()
+                    .gap_2()
+                    .justify_between()
+                    .bg(editor_bg_color)
+                    .cursor_pointer()
+                    .when(index + 1 < count, |parent| {
+                        parent.border_color(cx.theme().colors().border).border_b_1()
+                    })
+                    .hover(|style| style.bg(cx.theme().colors().element_hover))
+                    .child(Label::new(canvas.title.clone()).size(LabelSize::Small))
+                    .child(
+                        Icon::new(IconName::Maximize)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text("Open Canvas"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let session_key = session_key.clone();
+                        let workspace = this.workspace.clone();
+                        let result = workspace.update(cx, |workspace, cx| {
+                            surface::focus_surface(&session_key, index, workspace, window, cx)
+                        });
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => log::error!("canvas: failed to open: {err}"),
+                            Err(err) => log::error!("canvas: workspace unavailable: {err}"),
+                        }
+                    }))
             }))
     }
 
