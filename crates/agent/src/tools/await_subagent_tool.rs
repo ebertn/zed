@@ -122,7 +122,7 @@ impl AgentTool for AwaitSubagentTool {
                     error: e.to_string(),
                 })?;
 
-            let session_id = input.session_id.clone();
+            let session_id = input.session_id;
             let timeout =
                 Duration::from_secs(input.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS));
             let deadline = Instant::now() + timeout;

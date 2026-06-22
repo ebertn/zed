@@ -108,7 +108,7 @@ impl AgentTool for MessageSubagentTool {
                     error: e.to_string(),
                 })?;
 
-            let session_id = input.session_id.clone();
+            let session_id = input.session_id;
             let result = self
                 .environment
                 .message_subagent(session_id.clone(), input.message, cx);
