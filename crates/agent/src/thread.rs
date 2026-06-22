@@ -72,7 +72,12 @@ use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+/// Maximum subagent nesting depth. The root agent is depth 0; a subagent it
+/// spawns is depth 1, and so on. Threads at depth `< MAX_SUBAGENT_DEPTH` are
+/// given the subagent-spawning tools, so the deepest subagent that can exist is
+/// at depth `MAX_SUBAGENT_DEPTH` (it cannot nest further). A value of 3 allows
+/// three levels of subagents beneath the root.
+pub const MAX_SUBAGENT_DEPTH: u8 = 3;
 
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();
