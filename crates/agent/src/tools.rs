@@ -1,4 +1,6 @@
 mod apply_code_action_tool;
+mod await_subagent_tool;
+mod cancel_subagent_tool;
 mod context_server_registry;
 mod copy_path_tool;
 mod create_directory_tool;
@@ -17,15 +19,19 @@ mod go_to_definition_tool;
 mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
+mod list_subagents_tool;
+mod message_subagent_tool;
 mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
 mod skill_tool;
+mod spawn_agent_background_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
 mod web_search_tool;
+mod write_coordinator;
 mod write_file_tool;
 
 use crate::AgentTool;
@@ -63,6 +69,8 @@ where
 }
 
 pub use apply_code_action_tool::*;
+pub use await_subagent_tool::*;
+pub use cancel_subagent_tool::*;
 pub use context_server_registry::*;
 pub use copy_path_tool::*;
 pub use create_directory_tool::*;
@@ -78,10 +86,13 @@ pub use go_to_definition_tool::*;
 pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
+pub use list_subagents_tool::*;
+pub use message_subagent_tool::*;
 pub use move_path_tool::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use skill_tool::*;
+pub use spawn_agent_background_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
 pub use terminal_tool::*;
@@ -217,4 +228,17 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether `tool_name` is one of the background sub-agent management tools,
+/// gated by the `background_subagents_enabled` setting.
+pub fn is_background_subagent_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        SpawnAgentBackgroundTool::NAME
+            | ListSubagentsTool::NAME
+            | AwaitSubagentTool::NAME
+            | MessageSubagentTool::NAME
+            | CancelSubagentTool::NAME
+    )
 }

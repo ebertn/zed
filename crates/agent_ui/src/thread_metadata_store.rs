@@ -1853,6 +1853,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             action_log: Vec::new(),
+            background_subagents: Vec::new(),
         }
     }
 

@@ -87,6 +87,26 @@ pub struct DbThread {
     /// stats and the keep/reject review survive reloading the thread.
     #[serde(default)]
     pub action_log: Vec<action_log::SerializedEdit>,
+    /// Background subagents spawned by this thread, persisted so they remain
+    /// visible (with their results) after a restart. On reload, ones that were
+    /// running are restored as interrupted.
+    #[serde(default)]
+    pub background_subagents: Vec<DbBackgroundSubagent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbBackgroundSubagent {
+    pub session_id: acp::SessionId,
+    pub label: String,
+    /// One of "running", "completed", "failed", "cancelled". A "running" status
+    /// is restored as interrupted, since its driver did not survive the restart.
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -138,6 +158,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             action_log: Vec::new(),
+            background_subagents: Vec::new(),
         }
     }
 
@@ -323,6 +344,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             action_log: Vec::new(),
+            background_subagents: Vec::new(),
         })
     }
 }
@@ -775,6 +797,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             action_log: Vec::new(),
+            background_subagents: Vec::new(),
         }
     }
 
