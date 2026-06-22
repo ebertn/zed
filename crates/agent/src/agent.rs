@@ -817,6 +817,7 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(&thread_handle, Self::handle_background_subagents_updated),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
@@ -1334,6 +1335,65 @@ impl NativeAgent {
         session.acp_thread.update(cx, |acp_thread, cx| {
             acp_thread.update_token_usage(usage.0.clone(), cx);
         });
+    }
+
+    fn handle_background_subagents_updated(
+        &mut self,
+        thread: Entity<Thread>,
+        _event: &BackgroundSubagentsUpdated,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = thread.read(cx).id().clone();
+        // Re-render the subagent tool-call cards so their status icon reflects
+        // the live background-subagent status (spinner while running, then a
+        // check/error when terminal).
+        if let Some(session) = self.sessions.get(&session_id) {
+            session.acp_thread.update(cx, |acp_thread, cx| {
+                acp_thread.refresh_subagent_tool_calls(cx);
+            });
+        }
+        self.deliver_completed_background_subagents(session_id, cx);
+    }
+
+    /// Auto-pull-when-idle: if the primary thread for `session_id` is idle and
+    /// has background subagents that finished but haven't been surfaced yet,
+    /// start a turn that delivers their results so the agent can react. Routes
+    /// the turn's events to the ACP thread exactly like a user-initiated prompt.
+    fn deliver_completed_background_subagents(
+        &mut self,
+        session_id: acp::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let thread = session.thread.clone();
+        let acp_thread = session.acp_thread.clone();
+
+        let summary = thread.update(cx, |thread, _cx| thread.auto_pull_summary_if_idle());
+        let Some(summary) = summary else {
+            return;
+        };
+
+        let response_stream = thread.update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), [summary.as_str()], cx)
+        });
+        let response_stream = match response_stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                log::error!("Failed to deliver background subagent results: {error}");
+                return;
+            }
+        };
+
+        let connection = Some(NativeAgentConnection(cx.entity()));
+        NativeAgentConnection::handle_thread_events(
+            response_stream,
+            acp_thread.downgrade(),
+            connection,
+            cx,
+        )
+        .detach();
     }
 
     fn handle_project_event(
@@ -3246,6 +3306,63 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         self.resume_subagent_thread(session_id, cx)
     }
 
+    fn list_subagents(&self, cx: &App) -> Vec<SubagentSummary> {
+        self.thread
+            .upgrade()
+            .map(|thread| thread.read(cx).background_subagent_summaries())
+            .unwrap_or_default()
+    }
+
+    fn cancel_subagent(
+        &self,
+        session_id: acp::SessionId,
+        cx: &mut App,
+    ) -> Result<SubagentSummary> {
+        let thread = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?;
+        thread.update(cx, |thread, cx| {
+            thread.cancel_background_subagent(&session_id, cx)
+        })
+    }
+
+    fn message_subagent(
+        &self,
+        session_id: acp::SessionId,
+        message: String,
+        cx: &mut AsyncApp,
+    ) -> Result<SubagentMessageResult> {
+        let parent = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?;
+
+        // If the subagent is running, queue the message for its driver to pick
+        // up after the current turn. Otherwise resume the session with it.
+        let outcome = parent.update(cx, |parent, _cx| {
+            parent.enqueue_subagent_message(&session_id, message.clone())
+        });
+
+        match outcome {
+            SubagentMessageOutcome::Queued => Ok(SubagentMessageResult::Queued),
+            SubagentMessageOutcome::NeedsResume => {
+                let label = cx
+                    .update(|cx| {
+                        parent
+                            .read(cx)
+                            .background_subagent(&session_id)
+                            .map(|subagent| subagent.label.clone())
+                    })
+                    .unwrap_or_else(|| SharedString::from("subagent"));
+                let subagent =
+                    cx.update(|cx| self.resume_subagent_thread(session_id.clone(), cx))?;
+                subagent.spawn_detached(message, label, cx)?;
+                Ok(SubagentMessageResult::Resumed)
+            }
+        }
+    }
+
     fn create_sibling_thread(
         &self,
         request: SiblingThreadRequest,
@@ -3289,6 +3406,7 @@ enum SubagentPromptResult {
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct NativeSubagentHandle {
     session_id: acp::SessionId,
     parent_thread: WeakEntity<Thread>,
@@ -3310,18 +3428,21 @@ impl NativeSubagentHandle {
             acp_thread,
         }
     }
-}
 
-impl SubagentHandle for NativeSubagentHandle {
-    fn id(&self) -> acp::SessionId {
-        self.session_id.clone()
-    }
-
-    fn num_entries(&self, cx: &App) -> usize {
-        self.acp_thread.read(cx).entries().len()
-    }
-
-    fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
+    /// Drives one prompt to completion on the subagent thread.
+    ///
+    /// `register_running` controls whether the subagent joins the parent's
+    /// turn-scoped `running_subagents` set. Blocking `spawn_agent` children pass
+    /// `true` (so cancelling the parent turn stops them). Background subagents
+    /// pass `false`: they are tracked only in `background_subagents` and must be
+    /// completely independent of the turn-cancel path, otherwise a parent-turn
+    /// cancel could non-deterministically stop them.
+    fn run_prompt(
+        &self,
+        message: String,
+        register_running: bool,
+        cx: &AsyncApp,
+    ) -> Task<Result<String>> {
         let thread = self.subagent_thread.clone();
         let acp_thread = self.acp_thread.clone();
         let subagent_session_id = self.session_id.clone();
@@ -3334,11 +3455,13 @@ impl SubagentHandle for NativeSubagentHandle {
                     .latest_token_usage()
                     .map(|usage| usage.ratio());
 
-                parent_thread
-                    .update(cx, |parent_thread, _cx| {
-                        parent_thread.register_running_subagent(thread.downgrade())
-                    })
-                    .ok();
+                if register_running {
+                    parent_thread
+                        .update(cx, |parent_thread, _cx| {
+                            parent_thread.register_running_subagent(thread.downgrade())
+                        })
+                        .ok();
+                }
 
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
@@ -3422,14 +3545,108 @@ impl SubagentHandle for NativeSubagentHandle {
                 }
             };
 
-            parent_thread
-                .update(cx, |parent_thread, cx| {
-                    parent_thread.unregister_running_subagent(&subagent_session_id, cx)
-                })
-                .ok();
+            if register_running {
+                parent_thread
+                    .update(cx, |parent_thread, cx| {
+                        parent_thread.unregister_running_subagent(&subagent_session_id, cx)
+                    })
+                    .ok();
+            }
 
             result
         })
+    }
+}
+
+impl SubagentHandle for NativeSubagentHandle {
+    fn id(&self) -> acp::SessionId {
+        self.session_id.clone()
+    }
+
+    fn num_entries(&self, cx: &App) -> usize {
+        self.acp_thread.read(cx).entries().len()
+    }
+
+    fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>> {
+        self.run_prompt(message, true, cx)
+    }
+
+    fn spawn_detached(
+        &self,
+        message: String,
+        label: SharedString,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        // Drive the subagent without registering it in the parent's turn-scoped
+        // `running_subagents` set: background subagents must survive parent-turn
+        // cancellation. The parent owns the driver task and learns the result
+        // via its background-subagent registry.
+        let handle = self.clone();
+        let parent_thread = self.parent_thread.clone();
+        let session_id = self.session_id.clone();
+        let thread_weak = self.subagent_thread.downgrade();
+
+        let driver = cx.spawn({
+            let parent_thread = parent_thread.clone();
+            let session_id = session_id.clone();
+            async move |cx| {
+                let mut next_message = Some(message);
+                while let Some(message) = next_message.take() {
+                    match handle.run_prompt(message, false, cx).await {
+                        Ok(output) => {
+                            // Atomically pick up a queued follow-up message, or
+                            // finalize as completed if none. Doing both in one
+                            // synchronous update closes the race with
+                            // `message_subagent`: an enqueue either lands before
+                            // this (and is taken here) or after (and observes a
+                            // terminal status, so it resumes instead).
+                            next_message = parent_thread
+                                .update(cx, |parent_thread, cx| {
+                                    match parent_thread.take_next_subagent_message(&session_id) {
+                                        Some(message) => Some(message),
+                                        None => {
+                                            parent_thread.set_background_subagent_status(
+                                                &session_id,
+                                                SubagentStatus::Completed { output },
+                                                cx,
+                                            );
+                                            None
+                                        }
+                                    }
+                                })
+                                .ok()
+                                .flatten();
+                        }
+                        Err(error) => {
+                            parent_thread
+                                .update(cx, |parent_thread, cx| {
+                                    parent_thread.set_background_subagent_status(
+                                        &session_id,
+                                        SubagentStatus::Failed {
+                                            error: error.to_string(),
+                                        },
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        parent_thread.update(cx, |parent_thread, cx| {
+            parent_thread.register_background_subagent(
+                session_id,
+                label,
+                thread_weak,
+                driver,
+                cx,
+            );
+        })?;
+
+        Ok(())
     }
 }
 

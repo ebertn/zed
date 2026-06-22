@@ -1,11 +1,12 @@
 use crate::{
-    ApplyCodeActionTool, CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
-    CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool,
-    FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
-    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    ApplyCodeActionTool, AwaitSubagentTool, CancelSubagentTool, CodeActionStore,
+    ContextServerRegistry, CopyPathTool, CreateDirectoryTool, CreateThreadTool, DbLanguageModel,
+    DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, ListSubagentsTool, MessageSubagentTool, MovePathTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentBackgroundTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -143,6 +144,96 @@ pub struct SubagentContext {
 
     /// Current depth level (0 = root agent, 1 = first-level subagent, etc.)
     pub depth: u8,
+}
+
+/// Lifecycle status of a background subagent, as tracked by its parent thread.
+#[derive(Clone, Debug)]
+pub enum SubagentStatus {
+    /// The subagent is currently running a turn.
+    Running,
+    /// The subagent finished successfully. Holds its final assistant message.
+    Completed { output: String },
+    /// The subagent stopped with an error.
+    Failed { error: String },
+    /// The subagent was explicitly cancelled (by the primary agent or the user).
+    Cancelled,
+}
+
+impl SubagentStatus {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, SubagentStatus::Running)
+    }
+
+    /// A short, model- and UI-friendly label for the status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SubagentStatus::Running => "running",
+            SubagentStatus::Completed { .. } => "completed",
+            SubagentStatus::Failed { .. } => "failed",
+            SubagentStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A serializable snapshot of a background subagent, for tools and telemetry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubagentSummary {
+    pub session_id: acp::SessionId,
+    pub label: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of trying to enqueue a message for a background subagent.
+pub enum SubagentMessageOutcome {
+    /// The subagent is running; the message was queued and will be delivered as a
+    /// follow-up turn once the current one finishes.
+    Queued,
+    /// The subagent is idle/finished (or no longer tracked); the caller should
+    /// resume its session with the message instead of queueing.
+    NeedsResume,
+}
+
+/// How a `message_subagent` request was handled.
+#[derive(Clone, Debug)]
+pub enum SubagentMessageResult {
+    /// Queued for delivery after the subagent's current turn finishes.
+    Queued,
+    /// The subagent was idle/finished and was resumed with the message.
+    Resumed,
+}
+
+impl SubagentMessageResult {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SubagentMessageResult::Queued => "queued",
+            SubagentMessageResult::Resumed => "resumed",
+        }
+    }
+}
+
+/// A subagent that runs in the background, decoupled from the tool call that
+/// spawned it. The parent thread owns the driver task (dropping it cancels the
+/// work) and tracks status for monitoring, auto-pull, and cancellation.
+pub struct BackgroundSubagent {
+    pub session_id: acp::SessionId,
+    pub label: SharedString,
+    pub status: SubagentStatus,
+    /// Weak handle to the subagent's thread, for inspection and cancellation.
+    pub thread: WeakEntity<Thread>,
+    /// Whether the terminal result has already been delivered back to the
+    /// primary agent (via auto-pull or an explicit collect tool).
+    pub delivered: bool,
+    /// Follow-up messages queued by `message_subagent` while the subagent was
+    /// running. Drained by the driver after each turn completes.
+    pending_messages: Vec<String>,
+    /// The detached driver task. Held here purely to keep the work alive;
+    /// dropping it cancels the subagent (GPUI Task semantics).
+    #[allow(dead_code)]
+    driver: Task<()>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -748,6 +839,21 @@ pub trait SubagentHandle {
     fn num_entries(&self, cx: &App) -> usize;
     /// Runs a turn for a given message and returns both the response and the index of that output message.
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
+    /// Starts a turn in the background and returns immediately. The subagent runs
+    /// to completion independently; its terminal status is reported back to the
+    /// parent thread's background-subagent registry. The parent owns the driver
+    /// task that keeps the work alive.
+    fn spawn_detached(
+        &self,
+        message: String,
+        label: SharedString,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let _ = (message, label, cx);
+        Err(anyhow::anyhow!(
+            "Background subagents are not supported in this environment"
+        ))
+    }
 }
 
 pub trait ThreadEnvironment {
@@ -771,6 +877,33 @@ pub trait ThreadEnvironment {
         Err(anyhow::anyhow!(
             "Resuming subagent sessions is not supported"
         ))
+    }
+
+    /// Returns snapshots of the background subagents owned by this thread.
+    fn list_subagents(&self, _cx: &App) -> Vec<SubagentSummary> {
+        Vec::new()
+    }
+
+    /// Cancels a running background subagent, returning its final summary.
+    fn cancel_subagent(
+        &self,
+        _session_id: acp::SessionId,
+        _cx: &mut App,
+    ) -> Result<SubagentSummary> {
+        Err(anyhow::anyhow!(
+            "Cancelling subagent sessions is not supported"
+        ))
+    }
+
+    /// Delivers a follow-up message to a background subagent: queued if it is
+    /// running, otherwise the subagent is resumed with the message.
+    fn message_subagent(
+        &self,
+        _session_id: acp::SessionId,
+        _message: String,
+        _cx: &mut AsyncApp,
+    ) -> Result<SubagentMessageResult> {
+        Err(anyhow::anyhow!("Messaging subagents is not supported"))
     }
 
     /// Creates an independent sibling thread visible in the agent sidebar.
@@ -1266,6 +1399,10 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// Background subagents owned by this thread. Keyed by subagent session id.
+    /// Holds the detached driver tasks (keeping the work alive) and status for
+    /// monitoring, auto-pull, and cancellation.
+    background_subagents: HashMap<acp::SessionId, BackgroundSubagent>,
     inherits_parent_model_settings: bool,
     sandboxed_terminal_temp_dir: Option<PathBuf>,
     /// Sandbox permissions the user approved "for the rest of the thread".
@@ -1406,6 +1543,7 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            background_subagents: HashMap::default(),
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
@@ -1784,6 +1922,7 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            background_subagents: HashMap::default(),
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: db_thread.sandboxed_terminal_temp_dir,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
@@ -2151,6 +2290,11 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
+            self.add_tool(SpawnAgentBackgroundTool::new(environment.clone()));
+            self.add_tool(ListSubagentsTool::new(environment.clone()));
+            self.add_tool(MessageSubagentTool::new(environment.clone()));
+            self.add_tool(AwaitSubagentTool::new(environment.clone()));
+            self.add_tool(CancelSubagentTool::new(environment.clone()));
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -2237,11 +2381,28 @@ impl Thread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        // Cancel turn-scoped subagents (e.g. blocking `spawn_agent` children),
+        // but preserve background subagents: they outlive the current turn and
+        // must keep running so the user can keep talking to the primary agent.
+        // Background subagents are cancelled explicitly via
+        // `cancel_background_subagent` / `cancel_all_background_subagents`.
+        let background_ids: HashSet<acp::SessionId> =
+            self.background_subagents.keys().cloned().collect();
+        let mut retained = Vec::new();
         for subagent in self.running_subagents.drain(..) {
-            if let Some(subagent) = subagent.upgrade() {
-                subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
+            if let Some(subagent_entity) = subagent.upgrade() {
+                let is_background =
+                    background_ids.contains(&subagent_entity.read(cx).id().clone());
+                if is_background {
+                    retained.push(subagent);
+                    continue;
+                }
+                subagent_entity
+                    .update(cx, |thread, cx| thread.cancel(cx))
+                    .detach();
             }
         }
+        self.running_subagents = retained;
 
         let Some(running_turn) = self.running_turn.take() else {
             self.flush_pending_message(cx);
@@ -2585,7 +2746,10 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    this.running_turn.take();
+                    cx.emit(BackgroundSubagentsUpdated);
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(
@@ -2692,7 +2856,13 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    this.running_turn.take();
+                    // Now that the turn is over, give the agent a chance to
+                    // surface any background subagents that finished while the
+                    // turn was running (auto-pull-when-idle).
+                    cx.emit(BackgroundSubagentsUpdated);
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(event_stream, tools, cancellation_tx, task));
@@ -4147,6 +4317,206 @@ impl Thread {
         self.running_subagents.push(subagent);
     }
 
+    /// Registers a background subagent and takes ownership of its driver task.
+    /// Called from `SubagentHandle::spawn_detached` once the work has been kicked off.
+    pub(crate) fn register_background_subagent(
+        &mut self,
+        session_id: acp::SessionId,
+        label: SharedString,
+        thread: WeakEntity<Thread>,
+        driver: Task<()>,
+        cx: &mut Context<Self>,
+    ) {
+        self.background_subagents.insert(
+            session_id.clone(),
+            BackgroundSubagent {
+                session_id,
+                label,
+                status: SubagentStatus::Running,
+                thread,
+                delivered: false,
+                pending_messages: Vec::new(),
+                driver,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Updates the tracked status of a background subagent (typically to a
+    /// terminal status when its driver completes). Never overwrites a status
+    /// that is already terminal, so an explicit cancellation is not clobbered by
+    /// the driver's later result.
+    pub(crate) fn set_background_subagent_status(
+        &mut self,
+        session_id: &acp::SessionId,
+        status: SubagentStatus,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(subagent) = self.background_subagents.get_mut(session_id) {
+            if subagent.status.is_terminal() {
+                return;
+            }
+            subagent.status = status;
+            cx.emit(BackgroundSubagentsUpdated);
+            cx.notify();
+        }
+    }
+
+    /// All background subagents owned by this thread.
+    pub fn background_subagents(&self) -> impl Iterator<Item = &BackgroundSubagent> {
+        self.background_subagents.values()
+    }
+
+    /// Look up a single background subagent by session id.
+    pub fn background_subagent(&self, session_id: &acp::SessionId) -> Option<&BackgroundSubagent> {
+        self.background_subagents.get(session_id)
+    }
+
+    /// Whether any background subagent is still running.
+    pub fn has_running_background_subagents(&self) -> bool {
+        self.background_subagents
+            .values()
+            .any(|subagent| !subagent.status.is_terminal())
+    }
+
+    /// Queues a follow-up message for a running background subagent, or reports
+    /// that the subagent is idle/finished and should be resumed instead.
+    pub(crate) fn enqueue_subagent_message(
+        &mut self,
+        session_id: &acp::SessionId,
+        message: String,
+    ) -> SubagentMessageOutcome {
+        match self.background_subagents.get_mut(session_id) {
+            Some(subagent) if !subagent.status.is_terminal() => {
+                subagent.pending_messages.push(message);
+                SubagentMessageOutcome::Queued
+            }
+            _ => SubagentMessageOutcome::NeedsResume,
+        }
+    }
+
+    /// Pops the next queued follow-up message for a background subagent, if any.
+    /// Called by the driver after each turn so queued messages run in order.
+    pub(crate) fn take_next_subagent_message(
+        &mut self,
+        session_id: &acp::SessionId,
+    ) -> Option<String> {
+        let subagent = self.background_subagents.get_mut(session_id)?;
+        if subagent.pending_messages.is_empty() {
+            None
+        } else {
+            Some(subagent.pending_messages.remove(0))
+        }
+    }
+
+    /// If the primary thread is idle (no running turn, no queued user message)
+    /// and this is not itself a subagent, returns a summary of background
+    /// subagents that finished but haven't been surfaced yet, marking them as
+    /// delivered. Returns `None` otherwise. Used for auto-pull-when-idle.
+    pub(crate) fn auto_pull_summary_if_idle(&mut self) -> Option<String> {
+        if self.running_turn.is_some()
+            || self.has_queued_message
+            || self.subagent_context.is_some()
+        {
+            return None;
+        }
+        self.take_undelivered_completed_summary()
+    }
+
+    /// Builds a summary of finished-but-undelivered background subagents and
+    /// marks them delivered. Returns `None` if there are none.
+    fn take_undelivered_completed_summary(&mut self) -> Option<String> {
+        let mut sections = Vec::new();
+        for subagent in self.background_subagents.values_mut() {
+            if !subagent.status.is_terminal() || subagent.delivered {
+                continue;
+            }
+            subagent.delivered = true;
+            let detail = match &subagent.status {
+                SubagentStatus::Completed { output } => format!("completed:\n{output}"),
+                SubagentStatus::Failed { error } => format!("failed: {error}"),
+                SubagentStatus::Cancelled => "was cancelled.".to_string(),
+                SubagentStatus::Running => continue,
+            };
+            sections.push(format!(
+                "### {} (session {})\n{}",
+                subagent.label, subagent.session_id, detail
+            ));
+        }
+        if sections.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "[Automatic update] The following background sub-agent(s) finished while you \
+                 were idle. Review their results and continue the work, or report back to the \
+                 user:\n\n{}",
+                sections.join("\n\n")
+            ))
+        }
+    }
+
+    /// Serializable snapshots of all background subagents, for tools/telemetry.
+    pub fn background_subagent_summaries(&self) -> Vec<SubagentSummary> {
+        self.background_subagents
+            .values()
+            .map(|subagent| {
+                let (output, error) = match &subagent.status {
+                    SubagentStatus::Completed { output } => (Some(output.clone()), None),
+                    SubagentStatus::Failed { error } => (None, Some(error.clone())),
+                    SubagentStatus::Running | SubagentStatus::Cancelled => (None, None),
+                };
+                SubagentSummary {
+                    session_id: subagent.session_id.clone(),
+                    label: subagent.label.to_string(),
+                    status: subagent.status.label().to_string(),
+                    output,
+                    error,
+                }
+            })
+            .collect()
+    }
+
+    /// Cancels a single background subagent: stops its running turn and marks it
+    /// cancelled. Returns its summary, or an error if no such subagent exists.
+    pub fn cancel_background_subagent(
+        &mut self,
+        session_id: &acp::SessionId,
+        cx: &mut Context<Self>,
+    ) -> Result<SubagentSummary> {
+        let Some(subagent) = self.background_subagents.get_mut(session_id) else {
+            anyhow::bail!("No background subagent with session id {session_id}");
+        };
+        if let Some(thread) = subagent.thread.upgrade() {
+            thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+        }
+        if !subagent.status.is_terminal() {
+            subagent.status = SubagentStatus::Cancelled;
+        }
+        let summary = SubagentSummary {
+            session_id: subagent.session_id.clone(),
+            label: subagent.label.to_string(),
+            status: subagent.status.label().to_string(),
+            output: None,
+            error: None,
+        };
+        cx.notify();
+        Ok(summary)
+    }
+
+    /// Cancels every running background subagent. Used when the parent thread is
+    /// being torn down.
+    pub fn cancel_all_background_subagents(&mut self, cx: &mut Context<Self>) {
+        let session_ids: Vec<acp::SessionId> = self
+            .background_subagents
+            .values()
+            .filter(|subagent| !subagent.status.is_terminal())
+            .map(|subagent| subagent.session_id.clone())
+            .collect();
+        for session_id in session_ids {
+            self.cancel_background_subagent(&session_id, cx).ok();
+        }
+    }
+
     pub(crate) fn unregister_running_subagent(
         &mut self,
         subagent_session_id: &acp::SessionId,
@@ -4847,6 +5217,12 @@ impl EventEmitter<TitleUpdated> for Thread {}
 pub struct ModelChanged;
 
 impl EventEmitter<ModelChanged> for Thread {}
+
+/// Emitted when the set of background subagents or their statuses change, so the
+/// agent can attempt to surface finished subagents to an idle primary.
+pub struct BackgroundSubagentsUpdated;
+
+impl EventEmitter<BackgroundSubagentsUpdated> for Thread {}
 
 /// A channel-based wrapper that delivers tool input to a running tool.
 ///

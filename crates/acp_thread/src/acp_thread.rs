@@ -3311,6 +3311,24 @@ impl AcpThread {
         })
     }
 
+    /// Re-emits `EntryUpdated` for every subagent tool-call entry so their cards
+    /// re-render. Used to reflect background-subagent status changes (which live
+    /// on the native thread, not on the tool call itself).
+    pub fn refresh_subagent_tool_calls(&mut self, cx: &mut Context<Self>) {
+        let indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, entry)| match entry {
+                AgentThreadEntry::ToolCall(tool_call) if tool_call.is_subagent() => Some(ix),
+                _ => None,
+            })
+            .collect();
+        for ix in indices {
+            cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        }
+    }
+
     pub fn resolve_locations(&mut self, id: acp::ToolCallId, cx: &mut Context<Self>) {
         let project = self.project.clone();
         let should_update_agent_location = self.parent_session_id.is_none();
