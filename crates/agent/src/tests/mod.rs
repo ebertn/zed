@@ -5323,6 +5323,147 @@ async fn test_background_subagent_runs_without_blocking_parent(cx: &mut TestAppC
     assert_eq!(final_status, Some("completed:subagent done".to_string()));
 }
 
+/// Reproduction for the report that the parent "can't speak while subagents are
+/// running": after spawning a background subagent, the parent must be able to
+/// continue the SAME turn (emit text / call more tools) while the subagent is
+/// still running. Here we feed the parent's follow-up completion with text and
+/// assert it lands without ever completing the subagent.
+#[gpui::test]
+async fn test_parent_can_continue_turn_while_subagent_runs(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    let _send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning background subagents");
+    for (id, label, message) in [
+        ("bg_1", "bg label 1", "subagent task prompt one"),
+        ("bg_2", "bg label 2", "subagent task prompt two"),
+    ] {
+        let tool_input = SpawnAgentBackgroundToolInput {
+            label: label.to_string(),
+            message: message.to_string(),
+            session_id: None,
+        };
+        model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+            LanguageModelToolUse {
+                id: id.into(),
+                name: SpawnAgentBackgroundTool::NAME.into(),
+                raw_input: serde_json::to_string(&tool_input).unwrap(),
+                input: serde_json::to_value(&tool_input).unwrap(),
+                is_input_complete: true,
+                thought_signature: None,
+            },
+        ));
+    }
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Both subagents are registered and running. We deliberately never complete
+    // them.
+    let subagent_session_ids = thread.read_with(cx, |thread, _| {
+        thread
+            .background_subagents()
+            .map(|subagent| subagent.session_id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        subagent_session_ids.len(),
+        2,
+        "both background subagents should be registered"
+    );
+
+    // The parent's turn should have issued a follow-up completion (with the
+    // spawn tools' results). Find it: it carries the parent's "Prompt" text but
+    // NOT either subagent's prompt text.
+    let parent_request = model
+        .pending_completions()
+        .into_iter()
+        .find(|request| {
+            let has_parent = request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, MessageContent::Text(text) if text.contains("Prompt"))
+                })
+            });
+            let has_subagent = request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, MessageContent::Text(text) if text.contains("subagent task prompt"))
+                })
+            });
+            has_parent && !has_subagent
+        })
+        .expect(
+            "the parent should have issued a follow-up completion after spawning, so it can \
+             continue its turn while the subagents run",
+        );
+
+    // Answer the parent's follow-up with text only (the model "says hello").
+    model.send_completion_stream_text_chunk(&parent_request, "Hello!");
+    model.end_completion_stream(&parent_request);
+    cx.run_until_parked();
+
+    // The parent's reply landed even though the subagents never finished.
+    let all_still_running = thread.read_with(cx, |thread, _| {
+        subagent_session_ids.iter().all(|id| {
+            matches!(
+                thread.background_subagent(id).map(|s| s.status.clone()),
+                Some(SubagentStatus::Running)
+            )
+        })
+    });
+    assert!(
+        all_still_running,
+        "the subagents should still be running; the parent continued without waiting for them"
+    );
+
+    let parent_said_hello = thread.read_with(cx, |thread, _| {
+        thread.to_markdown().contains("Hello!")
+    });
+    assert!(
+        parent_said_hello,
+        "the parent should be able to speak (emit text) while the subagent is still running"
+    );
+}
+
 /// Verifies the Phase 6 cancellation split: cancelling the parent's turn (e.g.
 /// because the user sent a new message) must NOT cancel a background subagent.
 /// The background subagent keeps running and can still complete.
