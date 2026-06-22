@@ -75,9 +75,9 @@ pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 /// Maximum subagent nesting depth. The root agent is depth 0; a subagent it
 /// spawns is depth 1, and so on. Threads at depth `< MAX_SUBAGENT_DEPTH` are
 /// given the subagent-spawning tools, so the deepest subagent that can exist is
-/// at depth `MAX_SUBAGENT_DEPTH` (it cannot nest further). A value of 3 allows
-/// three levels of subagents beneath the root.
-pub const MAX_SUBAGENT_DEPTH: u8 = 3;
+/// at depth `MAX_SUBAGENT_DEPTH` (it cannot nest further). A value of 1 means
+/// only the root agent can spawn subagents.
+pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
 pub(crate) fn provider_compatible_tool_name(tool_name: &str) -> String {
     let mut sanitized = String::new();

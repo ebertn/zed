@@ -6615,63 +6615,6 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
     });
 }
 
-/// A subagent below the maximum depth still gets the subagent-spawning tools,
-/// so nesting works up to `MAX_SUBAGENT_DEPTH` levels.
-#[gpui::test]
-async fn test_intermediate_depth_subagent_can_spawn(cx: &mut TestAppContext) {
-    init_test(cx);
-
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["subagents".to_string()]);
-    });
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(path!("/test"), json!({})).await;
-    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
-    let project_context = cx.new(|_cx| ProjectContext::default());
-    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
-    let context_server_registry =
-        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
-    let model = Arc::new(FakeLanguageModel::default());
-    let environment = Rc::new(cx.update(|cx| {
-        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
-    }));
-
-    // A parent one level shallower than the deepest allowed subagent.
-    assert!(
-        MAX_SUBAGENT_DEPTH >= 2,
-        "this test assumes nesting is allowed beyond the first level"
-    );
-    let parent_thread = cx.new(|cx| {
-        let mut thread = Thread::new(
-            project.clone(),
-            project_context,
-            context_server_registry,
-            Templates::new(),
-            Some(model.clone()),
-            cx,
-        );
-        thread.set_subagent_context(SubagentContext {
-            parent_thread_id: acp::SessionId::new("parent-id"),
-            depth: MAX_SUBAGENT_DEPTH - 2,
-        });
-        thread
-    });
-    let subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&parent_thread, cx);
-        thread.add_default_tools(environment, cx);
-        thread
-    });
-
-    subagent_thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.depth(), MAX_SUBAGENT_DEPTH - 1);
-        assert!(
-            thread.has_registered_tool(SpawnAgentTool::NAME),
-            "a subagent below the max depth should still be able to spawn subagents"
-        );
-    });
-}
-
 #[gpui::test]
 async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
     init_test(cx);
