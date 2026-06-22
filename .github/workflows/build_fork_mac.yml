@@ -1,0 +1,106 @@
+name: build_fork_mac
+
+# Builds a production (release-optimized) macOS app bundle from the `build`
+# branch using Zed's own `script/bundle-mac`, then publishes the resulting
+# `.dmg` (and remote server) both as a workflow artifact and as assets on a
+# rolling `build-latest` GitHub Release. No Apple signing certificates are
+# required: the script ad-hoc signs the bundle when signing secrets are absent.
+#
+# Trigger this manually from the Actions tab ("Run workflow").
+#
+# NOTE: older GitHub-hosted macOS runners (e.g. macos-14 -> Xcode 15.4) ship a
+# libc++ that fails to compile `webrtc-sys` (a cxx/`rust::Slice::iterator`
+# incompatibility). We run on macos-15 and select the newest Xcode available,
+# which compiles cleanly.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: '1'
+
+concurrency:
+  group: build_fork_mac-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle_mac_aarch64:
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - name: Select newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Set up Node (needed for DMG license step)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bundle-mac-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bundle-mac-
+
+      - name: Build macOS app bundle (release)
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Upload Zed DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-aarch64.dmg
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
+
+      - name: Upload remote server
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-macos-aarch64.gz
+          path: target/zed-remote-server-macos-aarch64.gz
+          if-no-files-found: error
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-latest"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          # Replace any previous rolling release (and its tag) so the download
+          # URL stays stable at .../releases/download/build-latest/Zed-aarch64.dmg
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Latest build ($SHORT_SHA)" \
+            --prerelease \
+            --notes "Automated production build of the \`build\` branch (commit $SHORT_SHA).
+
+          Ad-hoc signed (no Apple Developer certificate). After mounting the DMG and copying \`Zed Dev.app\` to /Applications, clear the quarantine flag so Gatekeeper allows it:
+
+          \`\`\`
+          xattr -dr com.apple.quarantine \"/Applications/Zed Dev.app\"
+          \`\`\`
+
+          The \`zed-remote-server\` asset is only needed for remote/SSH development." \
+            target/aarch64-apple-darwin/release/Zed-aarch64.dmg \
+            target/zed-remote-server-macos-aarch64.gz
