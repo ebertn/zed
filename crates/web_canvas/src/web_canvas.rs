@@ -15,7 +15,7 @@ use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     SharedString, Styled as _, Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance,
-    actions, canvas, div,
+    actions, canvas, div, point, px, size,
 };
 use workspace::{Item, Workspace};
 
@@ -34,7 +34,10 @@ use surface::{SurfaceId, SurfaceProvider};
 use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple};
 
 #[cfg(target_os = "macos")]
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 actions!(
     canvas,
@@ -739,6 +742,11 @@ struct CanvasView {
     // rendered cleanly). Read by the `canvas_errors` tool.
     #[cfg(target_os = "macos")]
     errors: Rc<RefCell<Vec<String>>>,
+    // The floating Canvas/Code toggle's last painted bounds, excluded from the
+    // mouse-passthrough region so the toggle stays clickable while the rest of
+    // the canvas passes events through to the WebView.
+    #[cfg(target_os = "macos")]
+    toggle_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -789,6 +797,8 @@ impl CanvasView {
             _theme_subscription: theme_subscription,
             #[cfg(target_os = "macos")]
             errors,
+            #[cfg(target_os = "macos")]
+            toggle_bounds: Rc::new(Cell::new(None)),
             _watch_task: watch_task,
         }
     }
@@ -927,29 +937,30 @@ impl Render for CanvasView {
             CanvasMode::Code => self.render_code_view(cx).into_any_element(),
         };
 
-        // A top toolbar strip holds the Canvas/Code toggle. It is opaque and
-        // sits outside the transparency hole, so its clicks reach GPUI (the hole
-        // region passes mouse events through to the WebView; see
-        // `render_canvas_content`).
+        // The Canvas/Code toggle floats over the top-right of the content. Its
+        // rect is excluded from the mouse-passthrough region (see
+        // `render_canvas_content`) so it stays clickable even though the rest of
+        // the canvas passes events through to the WebView.
         div()
             .track_focus(&self.focus_handle)
             .size_full()
-            .flex()
-            .flex_col()
-            .child(self.render_toolbar(cx))
-            .child(div().flex_1().relative().child(content))
+            .relative()
+            .child(div().size_full().child(content))
+            .child(self.render_floating_toggle(cx))
     }
 }
 
 impl CanvasView {
     /// The rendered-canvas content: a transparency hole that the native WebView
     /// shows through. The `canvas()` painter keeps the WebView aligned with the
-    /// hole and registers the hole as a native mouse-passthrough region so the
-    /// WebView receives scroll/selection/click events.
+    /// hole and registers the hole as a native mouse-passthrough region (minus
+    /// the floating toggle's rect) so the WebView receives scroll/selection/
+    /// click events while the toggle stays clickable.
     fn render_canvas_content(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
         #[cfg(target_os = "macos")]
         {
             let webview = self.webview.clone();
+            let toggle_bounds = self.toggle_bounds.clone();
             div()
                 .size_full()
                 .bg(gpui::transparency_hole())
@@ -958,7 +969,8 @@ impl CanvasView {
                         |_bounds, _window, _cx| {},
                         move |bounds: Bounds<Pixels>, _, window, _cx| {
                             position_webview(webview.as_ref(), bounds);
-                            window.set_mouse_passthrough_rects(vec![bounds]);
+                            let rects = passthrough_rects(bounds, toggle_bounds.get());
+                            window.set_mouse_passthrough_rects(rects);
                         },
                     )
                     .size_full(),
@@ -971,8 +983,8 @@ impl CanvasView {
         }
     }
 
-    /// The opaque top strip containing the Canvas/Code toggle.
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Canvas/Code toggle, floating over the top-right of the content.
+    fn render_floating_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use theme::ActiveTheme as _;
 
         let view = cx.entity();
@@ -999,18 +1011,31 @@ impl CanvasView {
         .selected_index(selected_index)
         .auto_width();
 
-        div()
-            .flex()
-            .flex_row()
-            .w_full()
-            .items_center()
-            .justify_end()
-            .px_2()
-            .py_1()
+        let container = div()
+            .absolute()
+            .top_2()
+            .right_2()
+            .rounded_md()
             .bg(cx.theme().colors().elevated_surface_background)
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(toggle)
+            .child(toggle);
+
+        // Record the toggle's painted bounds so the passthrough region can
+        // exclude it (keeping it clickable over the WebView).
+        #[cfg(target_os = "macos")]
+        let container = {
+            let toggle_bounds = self.toggle_bounds.clone();
+            container.child(
+                canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds: Bounds<Pixels>, _, _window, _cx| {
+                        toggle_bounds.set(Some(bounds));
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+        };
+        container
     }
 
     /// A read-only editor over the `.canvas.tsx` source, or a placeholder while
@@ -1060,6 +1085,52 @@ impl Item for CanvasView {
         // so the tab that replaces this one receives events normally.
         window.set_mouse_passthrough_rects(Vec::new());
     }
+}
+
+/// The mouse-passthrough rectangles covering `content` minus `exclude` (the
+/// floating toggle), so the WebView receives events everywhere except where the
+/// toggle sits. Decomposes `content - exclude` into up to four non-overlapping
+/// bands; returns the whole `content` when there's nothing to exclude.
+#[cfg(target_os = "macos")]
+fn passthrough_rects(
+    content: Bounds<Pixels>,
+    exclude: Option<Bounds<Pixels>>,
+) -> Vec<Bounds<Pixels>> {
+    let Some(exclude) = exclude else {
+        return vec![content];
+    };
+    let c_left = f32::from(content.origin.x);
+    let c_top = f32::from(content.origin.y);
+    let c_right = c_left + f32::from(content.size.width);
+    let c_bottom = c_top + f32::from(content.size.height);
+
+    let ex_left = f32::from(exclude.origin.x).max(c_left);
+    let ex_top = f32::from(exclude.origin.y).max(c_top);
+    let ex_right = (f32::from(exclude.origin.x) + f32::from(exclude.size.width)).min(c_right);
+    let ex_bottom = (f32::from(exclude.origin.y) + f32::from(exclude.size.height)).min(c_bottom);
+
+    if ex_right <= ex_left || ex_bottom <= ex_top {
+        return vec![content];
+    }
+
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Bounds {
+        origin: point(px(x0), px(y0)),
+        size: size(px(x1 - x0), px(y1 - y0)),
+    };
+    let mut rects = Vec::new();
+    if ex_top > c_top {
+        rects.push(rect(c_left, c_top, c_right, ex_top));
+    }
+    if ex_bottom < c_bottom {
+        rects.push(rect(c_left, ex_bottom, c_right, c_bottom));
+    }
+    if ex_left > c_left {
+        rects.push(rect(c_left, ex_top, ex_left, ex_bottom));
+    }
+    if ex_right < c_right {
+        rects.push(rect(ex_right, ex_top, c_right, ex_bottom));
+    }
+    rects
 }
 
 /// Positions the WebView over `bounds` (GPUI window coordinates, top-left origin)
