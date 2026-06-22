@@ -426,7 +426,7 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 /// - `<Table headers={[…]} rows={[[…], …]} align={["left"|"right", …]} />`
 /// - `<BarChart data={[{ label, value }, …]} />`
 /// - `<Button variant="primary" onClick={fn}>…</Button>`, `<Badge tone="success|danger">…</Badge>`
-/// - `useHostTheme()` -> `{ kind: "light" | "dark" }`
+/// - `useHostTheme()` -> `{ kind: "light" | "dark", name: string | null, colors: Record<string, string> }`
 ///
 /// You may also use Tailwind utility classes via `className="…"` for layout/color.
 /// Keep it clean and readable: neutral grays, a single accent color, no gradients
@@ -665,6 +665,13 @@ struct CanvasView {
     // An `Rc` so the per-frame `canvas()` paint closure can hold a clone.
     #[cfg(target_os = "macos")]
     webview: Option<Rc<wry::WebView>>,
+    // The host theme payload (`window.__zedTheme`) the document was last built
+    // with, kept to detect actual theme changes among unrelated settings churn.
+    #[cfg(target_os = "macos")]
+    theme_json: String,
+    // Rebuilds the document when the host theme changes; dropped with the view.
+    #[cfg(target_os = "macos")]
+    _theme_subscription: Subscription,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -680,9 +687,18 @@ impl CanvasView {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         let window_handle = window.window_handle();
         #[cfg(target_os = "macos")]
-        let document = Rc::new(RefCell::new(canvas_document(title.as_ref(), &content)));
+        let theme_json = canvas_theme_json(cx);
+        #[cfg(target_os = "macos")]
+        let document = Rc::new(RefCell::new(canvas_document(
+            title.as_ref(),
+            &content,
+            &theme_json,
+        )));
         #[cfg(target_os = "macos")]
         let webview = attach_webview(window, document.clone()).map(Rc::new);
+        #[cfg(target_os = "macos")]
+        let theme_subscription =
+            cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
         let watch_task = Self::spawn_watch(path.clone(), cx);
 
         Self {
@@ -694,6 +710,10 @@ impl CanvasView {
             document,
             #[cfg(target_os = "macos")]
             webview,
+            #[cfg(target_os = "macos")]
+            theme_json,
+            #[cfg(target_os = "macos")]
+            _theme_subscription: theme_subscription,
             _watch_task: watch_task,
         }
     }
@@ -732,13 +752,28 @@ impl CanvasView {
     fn set_content(&mut self, content: &str, _cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         {
-            *self.document.borrow_mut() = canvas_document(self.title.as_ref(), content);
+            *self.document.borrow_mut() =
+                canvas_document(self.title.as_ref(), content, &self.theme_json);
             if let Some(webview) = self.webview.as_ref()
                 && let Err(err) = webview.load_url("zedcanvas://localhost/")
             {
                 log::error!("canvas: load_url failed: {err}");
             }
         }
+    }
+
+    /// Rebuilds the document with the latest host theme and reloads the WebView.
+    /// No-op when the serialized theme is unchanged, since the settings observer
+    /// fires on every settings change, not just theme changes.
+    #[cfg(target_os = "macos")]
+    fn refresh_theme(&mut self, cx: &mut Context<Self>) {
+        let theme_json = canvas_theme_json(cx);
+        if theme_json == self.theme_json {
+            return;
+        }
+        self.theme_json = theme_json;
+        let content = std::fs::read_to_string(&self.path).unwrap_or_default();
+        self.set_content(&content, cx);
     }
 }
 
@@ -1001,26 +1036,80 @@ impl raw_window_handle::HasWindowHandle for ContentViewHandle {
 
 /// Wraps a canvas component (JSX defining `function Canvas() { ... }`) in the
 /// React + Tailwind + `prose` runtime shell, ready to hand to the WebView.
-fn canvas_document(title: &str, body_tsx: &str) -> String {
+/// `theme_json` is the host theme payload injected as `window.__zedTheme`.
+fn canvas_document(title: &str, body_tsx: &str, theme_json: &str) -> String {
     let safe_title = title.replace('<', "&lt;").replace('>', "&gt;");
     // The body is embedded inside a <script>; neutralize any literal </script>.
     let safe_body = body_tsx.replace("</script>", "<\\/script>");
     CANVAS_SHELL
         .replace("CANVAS_TITLE_PLACEHOLDER", &safe_title)
+        .replace("\"CANVAS_THEME_PLACEHOLDER\"", theme_json)
         .replace("// CANVAS_BODY_PLACEHOLDER", &safe_body)
+}
+
+/// Serializes the active Zed theme into the JSON payload exposed to canvases as
+/// `window.__zedTheme` (and read by `useHostTheme()`). Colors are CSS
+/// `rgba(...)` strings so they can be dropped straight into styles.
+fn canvas_theme_json(cx: &App) -> String {
+    use theme::ActiveTheme as _;
+
+    let theme = cx.theme();
+    let colors = theme.colors();
+    let status = theme.status();
+    let kind = if theme.appearance().is_light() {
+        "light"
+    } else {
+        "dark"
+    };
+
+    serde_json::json!({
+        "kind": kind,
+        "name": theme.name.to_string(),
+        "colors": {
+            "background": css_color(colors.background),
+            "surface": css_color(colors.elevated_surface_background),
+            "panel": css_color(colors.panel_background),
+            "element": css_color(colors.element_background),
+            "border": css_color(colors.border),
+            "text": css_color(colors.text),
+            "textMuted": css_color(colors.text_muted),
+            "accent": css_color(colors.text_accent),
+            "error": css_color(status.error),
+            "warning": css_color(status.warning),
+            "success": css_color(status.success),
+            "info": css_color(status.info),
+        }
+    })
+    .to_string()
+    // Injected inside a <script>; escape `<` so a theme name can't break out.
+    .replace('<', "\\u003c")
+}
+
+/// Formats a GPUI color as a CSS `rgba(...)` string.
+fn css_color(color: gpui::Hsla) -> String {
+    let rgba = gpui::Rgba::from(color);
+    let to_u8 = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "rgba({}, {}, {}, {:.3})",
+        to_u8(rgba.r),
+        to_u8(rgba.g),
+        to_u8(rgba.b),
+        rgba.a.clamp(0.0, 1.0)
+    )
 }
 
 /// Default canvas shown by the `canvas: open canvas spike` action; also a
 /// reference for the component API.
 const DEFAULT_CANVAS: &str = r##"
 function Canvas() {
-  const { kind } = useHostTheme();
+  const { kind, name, colors } = useHostTheme();
   return (
     <Page>
       <h1>Canvas runtime is live</h1>
       <p>
         This canvas is a React component rendered with Tailwind and the{" "}
-        <code>prose</code> typography plugin. Host theme: <strong>{kind}</strong>.
+        <code>prose</code> typography plugin. Host theme:{" "}
+        <strong>{name || kind}</strong> ({kind}).
       </p>
       <Grid cols={3}>
         <Card title="Revenue"><Stat label="This month" value="$48.2k" delta="+12%" tone="up" /></Card>
@@ -1028,7 +1117,7 @@ function Canvas() {
         <Card title="NPS"><Stat label="Score" value="62" /></Card>
       </Grid>
       <h2>Sample bar chart</h2>
-      <BarChart data={[{label:"A",value:8},{label:"B",value:14},{label:"C",value:5},{label:"D",value:11}]} />
+      <BarChart data={[{label:"A",value:8},{label:"B",value:14},{label:"C",value:5},{label:"D",value:11}]} accent={colors.accent} />
       <h2>Table</h2>
       <Table headers={["Item","Count"]} rows={[["Alpha","12"],["Beta","34"],["Gamma","7"]]} align={["left","right"]} />
       <Row gap={3}>
@@ -1062,26 +1151,42 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
     );
   });
 </script>
+<script>
+  // Host theme injected by Zed. `useHostTheme()` reads this object; the bootstrap
+  // applies it as a `dark` class (so Tailwind `dark:` variants follow Zed's
+  // active theme rather than the OS setting) and as `--zed-*` CSS variables.
+  window.__zedTheme = "CANVAS_THEME_PLACEHOLDER";
+  (function () {
+    var t = window.__zedTheme;
+    if (!t) return;
+    document.documentElement.classList.toggle('dark', t.kind === 'dark');
+    var colors = t.colors || {};
+    var root = document.documentElement.style;
+    for (var key in colors) {
+      if (Object.prototype.hasOwnProperty.call(colors, key)) {
+        root.setProperty('--zed-' + key, colors[key]);
+      }
+    }
+  })();
+</script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
 <script>
   tailwind.config = {
-    darkMode: 'media',
+    darkMode: 'class',
     theme: { extend: { fontFamily: { serif: ['ETBembo', '"Palatino Linotype"', 'Palatino', 'Georgia', 'serif'] } } }
   };
 </script>
 <style>
   html, body { margin: 0; height: 100%; }
-  body { background: #fffff8; color: #111111; }
+  /* Driven by the host theme via `--zed-*` variables (see the theme bootstrap),
+     with light defaults as a fallback when no host theme is present. */
+  body { background: var(--zed-background, #fffff8); color: var(--zed-text, #111111); }
   /* Make code / equation blocks theme-aware even outside `prose` (e.g. inside a
-     Card), so agent-authored blocks follow dark mode automatically. */
-  pre, code, kbd, samp { background: rgba(0, 0, 0, 0.06); border-radius: 4px; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #151515; color: #dddddd; }
-    pre, code, kbd, samp { background: rgba(255, 255, 255, 0.08); color: inherit; }
-  }
+     Card), so agent-authored blocks follow the host theme automatically. */
+  pre, code, kbd, samp { background: var(--zed-element, rgba(0, 0, 0, 0.06)); border-radius: 4px; }
   #root { min-height: 100%; }
 </style>
 </head>
@@ -1091,14 +1196,13 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
 <script type="text/plain" id="canvas-sdk">
 function cx() { return Array.prototype.slice.call(arguments).filter(Boolean).join(' '); }
 function useHostTheme() {
-  const q = window.matchMedia('(prefers-color-scheme: dark)');
-  const [kind, setKind] = React.useState(q.matches ? 'dark' : 'light');
-  React.useEffect(() => {
-    const h = () => setKind(q.matches ? 'dark' : 'light');
-    q.addEventListener('change', h);
-    return () => q.removeEventListener('change', h);
-  }, []);
-  return { kind };
+  var t = (typeof window !== 'undefined' && window.__zedTheme) || null;
+  var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  return {
+    kind: t ? t.kind : (prefersDark ? 'dark' : 'light'),
+    name: t ? t.name : null,
+    colors: (t && t.colors) || {},
+  };
 }
 function Page({ children, prose = true, className }) {
   return <div className={cx('mx-auto max-w-3xl', prose && 'prose dark:prose-invert prose-headings:font-serif', className)}>{children}</div>;
@@ -1253,7 +1357,26 @@ declare global {
     type Element = any;
   }
 
-  function useHostTheme(): { kind: "light" | "dark" };
+  interface HostTheme {
+    kind: "light" | "dark";
+    name: string | null;
+    colors: {
+      background: string;
+      surface: string;
+      panel: string;
+      element: string;
+      border: string;
+      text: string;
+      textMuted: string;
+      accent: string;
+      error: string;
+      warning: string;
+      success: string;
+      info: string;
+      [key: string]: string;
+    };
+  }
+  function useHostTheme(): HostTheme;
 
   interface PageProps { children?: any; prose?: boolean; className?: string }
   function Page(props: PageProps): JSX.Element;

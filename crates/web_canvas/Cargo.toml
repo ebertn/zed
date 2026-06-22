@@ -18,7 +18,9 @@ project.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+settings.workspace = true
 surface.workspace = true
+theme.workspace = true
 workspace.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
