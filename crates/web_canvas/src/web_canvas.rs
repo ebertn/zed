@@ -93,7 +93,6 @@ pub fn init(cx: &mut App) {
             session_id: thread.id().clone(),
         });
         thread.add_tool(CanvasListTool);
-        thread.add_tool(CanvasFocusTool);
         thread.add_tool(CanvasErrorsTool);
     })
     .detach();
@@ -376,6 +375,26 @@ fn open_canvas_surface(title: &str, path: &Path, cx: &mut App) -> Result<Surface
     Ok(id)
 }
 
+/// The id of a live (open) canvas showing `path`, if any.
+fn live_canvas_id_for_path(path: &Path, cx: &App) -> Option<u64> {
+    let registry = cx.try_global::<CanvasRegistry>()?;
+    registry.instances.iter().find_map(|(id, weak)| {
+        weak.upgrade()
+            .filter(|view| view.read(cx).path == path)
+            .map(|_| *id)
+    })
+}
+
+/// Opens a canvas, or focuses the existing tab if one is already showing `path`
+/// (so opening the same canvas twice doesn't create duplicate tabs).
+fn open_or_focus_canvas(title: &str, path: &Path, cx: &mut App) -> Result<SurfaceId> {
+    if let Some(id) = live_canvas_id_for_path(path, cx) {
+        focus_canvas(id, cx)?;
+        return Ok(SurfaceId(id));
+    }
+    open_canvas_surface(title, path, cx)
+}
+
 /// Registers `~/.agents/canvases/` as a *non-visible* worktree of the active
 /// workspace's project, so the agent's `edit_file` and the language server
 /// (linting) work on canvas files without the folder cluttering the project
@@ -395,7 +414,7 @@ async fn ensure_canvas_worktree(cx: &mut gpui::AsyncApp) -> Result<()> {
 }
 
 /// Brings the canvas with `id` to the foreground (activates its tab) in the
-/// active workspace. Used by the `canvas_focus` agent tool.
+/// active workspace.
 fn focus_canvas(id: u64, cx: &mut App) -> Result<()> {
     let view = canvas_by_id(id, cx).ok_or_else(|| anyhow!("no open canvas with id {id}"))?;
     let (workspace, window) =
@@ -453,11 +472,12 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 /// information to the user (reports, dashboards, summaries, charts).
 ///
 /// Canvases are files. This tool opens the canvas for `title` (creating a
-/// starter file if one doesn't exist yet) and returns its file path. You then
-/// author it by editing that `.canvas.tsx` file directly with your normal file
-/// tools (`edit_file`) — it hot-reloads on save. Re-opening the same title
-/// reopens the existing file. Lint your edits with the `diagnostics` tool, and
-/// call `canvas_errors` to confirm it renders.
+/// starter file if one doesn't exist yet), or focuses its tab if it's already
+/// open, and returns its file path. You then author it by editing that
+/// `.canvas.tsx` file directly with your normal file tools (`edit_file`) — it
+/// hot-reloads on save. Re-opening the same title reopens the existing file.
+/// Lint your edits with the `diagnostics` tool, and call `canvas_errors` to
+/// confirm it renders.
 ///
 /// The file must define exactly one top-level `function Canvas() { ... }`
 /// returning the UI. IMPORTANT RULES for its contents:
@@ -532,7 +552,7 @@ impl AgentTool for CanvasOpenTool {
             ensure_canvas_worktree(cx).await.map_err(|err| err.to_string())?;
             let path_string = path.to_string_lossy().to_string();
             let id = cx
-                .update(|cx| open_canvas_surface(&input.title, &path, cx))
+                .update(|cx| open_or_focus_canvas(&input.title, &path, cx))
                 .map_err(|err| err.to_string())?;
             // Associate the canvas with this conversation so the thread view can
             // offer to (re)open it. `params` mirror what `CanvasProvider::open`
@@ -599,51 +619,6 @@ impl AgentTool for CanvasListTool {
                 .map(|(id, title)| serde_json::json!({ "id": id, "title": title.to_string() }))
                 .collect::<Vec<_>>();
             serde_json::to_string(&json).map_err(|err| err.to_string())
-        })
-    }
-}
-
-/// Brings an existing canvas to the foreground, identified by id.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct CanvasFocusToolInput {
-    /// The id of the canvas to focus (from `canvas_open` or `canvas_list`).
-    id: u64,
-}
-
-struct CanvasFocusTool;
-
-impl AgentTool for CanvasFocusTool {
-    type Input = CanvasFocusToolInput;
-    type Output = String;
-
-    const NAME: &'static str = "canvas_focus";
-
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
-    }
-
-    fn initial_title(
-        &self,
-        input: Result<Self::Input, serde_json::Value>,
-        _cx: &mut App,
-    ) -> SharedString {
-        match input {
-            Ok(input) => format!("Focus canvas {}", input.id).into(),
-            Err(_) => "Focus canvas".into(),
-        }
-    }
-
-    fn run(
-        self: Arc<Self>,
-        input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
-        cx: &mut App,
-    ) -> Task<Result<Self::Output, Self::Output>> {
-        cx.spawn(async move |cx| {
-            let input = input.recv().await.map_err(|err| err.to_string())?;
-            cx.update(|cx| focus_canvas(input.id, cx))
-                .map_err(|err| err.to_string())?;
-            Ok(format!("Focused canvas {}.", input.id))
         })
     }
 }
