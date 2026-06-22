@@ -592,6 +592,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    pub subagents_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -909,6 +910,17 @@ impl ThreadView {
                     cx.notify();
                 },
             ));
+
+            // Re-render when the native thread changes (e.g. a background
+            // subagent's status updates), so the activity-bar strip and the
+            // subagent cards reflect live status.
+            if let Some(native_thread) =
+                native_connection.thread(thread.read(cx).session_id(), cx)
+            {
+                subscriptions.push(cx.observe(&native_thread, |_this, _native_thread, cx| {
+                    cx.notify();
+                }));
+            }
         }
 
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
@@ -976,6 +988,7 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            subagents_expanded: false,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -2827,6 +2840,22 @@ impl ThreadView {
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
 
+        // Background subagents are tracked on the root native thread only. The
+        // bar shows only the running ones; finished/cancelled ones stay in the
+        // registry (so they remain messageable via `list_subagents`) but are not
+        // cluttering the bar.
+        let background_subagents = if thread.parent_session_id().is_none() {
+            self.as_native_thread(cx)
+                .map(|native| native.read(cx).background_subagent_summaries())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|subagent| subagent.status == "running")
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let has_subagents = !background_subagents.is_empty();
+
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
@@ -2836,6 +2865,7 @@ impl ThreadView {
             && plan.is_empty()
             && queue_is_empty
             && !has_awaiting_permission
+            && !has_subagents
         {
             return None;
         }
@@ -2850,6 +2880,7 @@ impl ThreadView {
         let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
+        let subagents_expanded = self.subagents_expanded;
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         // Drop shadows have no opaque surface to blend into on a transparent
@@ -2914,8 +2945,21 @@ impl ThreadView {
                             })
                         },
                     )
-                    .when(!queue_is_empty, |this| {
+                    .when(has_subagents, |this| {
                         this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
+                            this.child(Divider::horizontal().color(DividerColor::Border))
+                        })
+                        .child(self.render_subagents_summary(&background_subagents, cx))
+                        .when(subagents_expanded, |parent| {
+                            parent.child(self.render_subagents_entries(
+                                &background_subagents,
+                                window,
+                                cx,
+                            ))
+                        })
+                    })
+                    .when(!queue_is_empty, |this| {
+                        this.when(!plan.is_empty() || !changed_buffers.is_empty() || has_subagents, |this| {
                             this.child(Divider::horizontal().color(DividerColor::Border))
                         })
                         .child(self.render_message_queue_summary(window, cx))
@@ -3417,6 +3461,164 @@ impl ThreadView {
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
         self.local_queued_messages.clear();
         self.sync_queue_flag_to_native_thread(cx);
+    }
+
+    fn render_subagents_summary(
+        &self,
+        subagents: &[agent::SubagentSummary],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let running = subagents.iter().filter(|s| s.status == "running").count();
+        let plural = if subagents.len() == 1 { "" } else { "s" };
+        let title: SharedString =
+            format!("{} Running Sub-agent{plural}", subagents.len()).into();
+
+        h_flex()
+            .p_1()
+            .w_full()
+            .gap_1()
+            .justify_between()
+            .when(self.subagents_expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(
+                h_flex()
+                    .id("subagents_summary")
+                    .gap_1()
+                    .child(Disclosure::new(
+                        "subagents_disclosure",
+                        self.subagents_expanded,
+                    ))
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.subagents_expanded = !this.subagents_expanded;
+                        cx.notify();
+                    })),
+            )
+            .when(running > 0, |this| {
+                this.child(
+                    Button::new("cancel_all_subagents", "Cancel All")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(native) = this.as_native_thread(cx) {
+                                native.update(cx, |native, cx| {
+                                    native.cancel_all_background_subagents(cx);
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_subagents_entries(
+        &self,
+        subagents: &[agent::SubagentSummary],
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let last_index = subagents.len().saturating_sub(1);
+        v_flex().w_full().children(
+            subagents
+                .iter()
+                .enumerate()
+                .map(|(ix, summary)| self.render_subagent_summary_row(summary, ix < last_index, cx)),
+        )
+    }
+
+    fn render_subagent_summary_row(
+        &self,
+        summary: &agent::SubagentSummary,
+        with_divider: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let session_id = summary.session_id.clone();
+        let is_running = summary.status == "running";
+
+        let status_icon = match summary.status.as_str() {
+            "running" => SpinnerLabel::new().size(LabelSize::Small).into_any_element(),
+            "failed" => Icon::new(IconName::Close)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            "cancelled" => Icon::new(IconName::Circle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            _ => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+        };
+
+        let label: SharedString = if summary.label.is_empty() {
+            "Subagent".into()
+        } else {
+            summary.label.clone().into()
+        };
+
+        h_flex()
+            .pr_1()
+            .w_full()
+            .gap_1p5()
+            .justify_between()
+            .when(with_divider, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("open-subagent-{session_id}")))
+                    .flex_1()
+                    .min_w_0()
+                    .pl_2()
+                    .py_1()
+                    .gap_1p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text("Open sub-agent"))
+                    .child(h_flex().w_4().justify_center().child(status_icon))
+                    .child(Label::new(label).size(LabelSize::Small))
+                    .child(
+                        Label::new(summary.status.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener({
+                        let session_id = session_id.clone();
+                        move |this, _, window, cx| {
+                            this.server_view
+                                .update(cx, |server, cx| {
+                                    server.navigate_to_thread(session_id.clone(), window, cx);
+                                })
+                                .ok();
+                        }
+                    })),
+            )
+            .when(is_running, |row| {
+                row.child(
+                    IconButton::new(
+                        SharedString::from(format!("stop-subagent-{session_id}")),
+                        IconName::Stop,
+                    )
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Error)
+                    .tooltip(Tooltip::text("Stop sub-agent"))
+                    .on_click(cx.listener({
+                        let session_id = session_id.clone();
+                        move |this, _, _window, cx| {
+                            if let Some(native) = this.as_native_thread(cx) {
+                                native.update(cx, |native, cx| {
+                                    native.cancel_background_subagent(&session_id, cx).log_err();
+                                });
+                            }
+                            cx.notify();
+                        }
+                    })),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_plan_summary(
@@ -9498,25 +9700,49 @@ impl ThreadView {
         let files_changed = changed_buffers.len();
         let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
-        let is_running = matches!(
-            tool_call.status,
-            ToolCallStatus::Pending
-                | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation { .. }
-        );
-
-        let is_failed = matches!(
-            tool_call.status,
-            ToolCallStatus::Failed | ToolCallStatus::Rejected
-        );
-
-        let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
-            || tool_call.content.iter().any(|c| match c {
-                ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
-                    markdown.read(cx).source() == "User canceled"
-                }
-                _ => false,
+        // For background subagents the spawn tool completes immediately, so the
+        // tool-call status doesn't track the subagent's real progress. Prefer the
+        // live background-subagent status recorded on the parent thread; fall back
+        // to the tool-call status for inline (blocking) subagents.
+        let background_status = tool_call
+            .subagent_session_info
+            .as_ref()
+            .map(|info| info.session_id.clone())
+            .and_then(|session_id| {
+                self.as_native_thread(cx).and_then(|parent| {
+                    parent
+                        .read(cx)
+                        .background_subagent(&session_id)
+                        .map(|subagent| subagent.status.clone())
+                })
             });
+
+        let (is_running, is_failed, is_cancelled) = if let Some(status) = &background_status {
+            (
+                matches!(status, agent::SubagentStatus::Running),
+                matches!(status, agent::SubagentStatus::Failed { .. }),
+                matches!(status, agent::SubagentStatus::Cancelled),
+            )
+        } else {
+            let is_running = matches!(
+                tool_call.status,
+                ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::WaitingForConfirmation { .. }
+            );
+            let is_failed = matches!(
+                tool_call.status,
+                ToolCallStatus::Failed | ToolCallStatus::Rejected
+            );
+            let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
+                || tool_call.content.iter().any(|c| match c {
+                    ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
+                        markdown.read(cx).source() == "User canceled"
+                    }
+                    _ => false,
+                });
+            (is_running, is_failed, is_cancelled)
+        };
 
         let thread_title = thread
             .as_ref()

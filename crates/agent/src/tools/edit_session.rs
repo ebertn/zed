@@ -3,6 +3,7 @@ mod streaming_fuzzy_matcher;
 mod streaming_parser;
 
 use super::tool_permissions::resolve_creatable_global_skill_path;
+use super::write_coordinator::WriteCoordinator;
 use crate::{Thread, ToolCallEventStream};
 use acp_thread::Diff;
 use action_log::ActionLog;
@@ -357,6 +358,9 @@ pub(crate) struct EditSession {
     parser: StreamingParser,
     pipeline: Pipeline,
     context: Arc<EditSessionContext>,
+    /// Held for the lifetime of the session to serialize edits to this buffer
+    /// across all agents (see [`WriteCoordinator`]).
+    _write_guard: async_lock::MutexGuardArc<()>,
     _finalize_diff_guard: Deferred<Box<dyn FnOnce()>>,
 }
 
@@ -702,6 +706,13 @@ impl EditSession {
                 .map_err(|e| e.to_string())?,
         };
 
+        // Serialize edits to this buffer across all agents (primary + background
+        // subagents). Held for the session's lifetime; concurrent sessions on the
+        // same buffer wait here, then re-resolve against the updated content.
+        let buffer_lock =
+            cx.update(|cx| WriteCoordinator::buffer_lock(buffer.entity_id(), cx));
+        let write_guard = buffer_lock.lock_arc().await;
+
         let file_changed_since_last_read =
             ensure_buffer_saved(&buffer, &abs_path, mode, &context, event_stream, cx).await?;
 
@@ -737,6 +748,7 @@ impl EditSession {
             parser: StreamingParser::default(),
             pipeline: Pipeline::new(mode, file_changed_since_last_read),
             context,
+            _write_guard: write_guard,
             _finalize_diff_guard: finalize_diff_guard,
         })
     }

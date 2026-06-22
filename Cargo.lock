@@ -247,6 +247,7 @@ dependencies = [
  "assets",
  "async-channel 2.5.0",
  "async-io",
+ "async-lock",
  "chrono",
  "client",
  "clock",
