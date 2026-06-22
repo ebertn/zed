@@ -974,6 +974,7 @@ mod tests {
             tool_permissions: Default::default(),
             sandbox_permissions: Default::default(),
             tool_output_inline_limit: 65536,
+            tool_output_max_lines: 24,
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),

@@ -243,6 +243,7 @@ pub struct AgentSettings {
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
     pub tool_output_inline_limit: usize,
+    pub tool_output_max_lines: usize,
 }
 
 impl AgentSettings {
@@ -790,6 +791,7 @@ impl Settings for AgentSettings {
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
             tool_output_inline_limit: agent.tool_output_inline_limit.unwrap_or(65536),
+            tool_output_max_lines: agent.tool_output_max_lines.unwrap_or(10),
         }
     }
 }

@@ -398,6 +398,17 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 65536
     pub tool_output_inline_limit: Option<usize>,
+    /// Maximum number of lines a tool output, file diff, or terminal block in
+    /// the agent thread shows before it is collapsed behind an expand control.
+    /// Both the collapsed and expanded states are height-capped, so a very
+    /// large buffer never renders at full height (which can cause UI
+    /// performance problems). Expanding a block raises the cap; it does not
+    /// remove it.
+    ///
+    /// Set to 0 to disable the cap and render blocks at full height.
+    ///
+    /// Default: 10
+    pub tool_output_max_lines: Option<usize>,
 }
 
 impl AgentSettingsContent {
