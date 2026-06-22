@@ -747,6 +747,10 @@ pub(crate) enum BackgroundTag {
     LinearGradient = 1,
     PatternSlash = 2,
     Checkerboard = 3,
+    /// Clears the framebuffer to fully transparent (alpha 0) over the quad's
+    /// bounds, "punching a hole" in the window so a native view layered behind
+    /// the renderer's surface shows through. Used by the web canvas on macOS.
+    TransparencyHole = 4,
 }
 
 /// A color space for color interpolation.
@@ -805,6 +809,7 @@ impl std::fmt::Debug for Background {
                 "Checkerboard({:?}, {})",
                 self.solid, self.gradient_angle_or_pattern_height
             ),
+            BackgroundTag::TransparencyHole => write!(f, "TransparencyHole"),
         }
     }
 }
@@ -820,6 +825,23 @@ impl Default for Background {
             colors: [LinearColorStop::default(), LinearColorStop::default()],
             pad: 0,
         }
+    }
+}
+
+/// Creates a transparency hole background.
+///
+/// A quad painted with this background clears the renderer's surface to fully
+/// transparent (alpha 0) over its bounds, rather than drawing a color. On a
+/// window whose surface is non-opaque, this lets a native view layered behind
+/// the surface (such as a `WKWebView`) show through, while content the
+/// renderer paints later in the frame (menus, overlays) still composites on
+/// top. Only the macOS renderer implements the clear; other backends treat it
+/// as a no-op transparent fill.
+pub fn transparency_hole() -> Background {
+    Background {
+        tag: BackgroundTag::TransparencyHole,
+        solid: Hsla::transparent_black(),
+        ..Default::default()
     }
 }
 
@@ -917,6 +939,13 @@ impl Background {
         }
     }
 
+    /// Returns whether this background is a transparency hole, which clears the
+    /// renderer's surface to fully transparent over the quad's bounds. See
+    /// [`transparency_hole`].
+    pub fn is_transparency_hole(&self) -> bool {
+        self.tag == BackgroundTag::TransparencyHole
+    }
+
     /// Use specified color space for color interpolation.
     ///
     /// <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
@@ -943,6 +972,9 @@ impl Background {
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
             BackgroundTag::Checkerboard => self.solid.is_transparent(),
+            // A transparency hole must always be painted: it actively clears the
+            // framebuffer rather than drawing a (skippable) transparent color.
+            BackgroundTag::TransparencyHole => false,
         }
     }
 }

@@ -777,6 +777,7 @@ fn main() {
         feedback::init(cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);
+        web_canvas::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);
         settings_ui::init(cx);

@@ -110,6 +110,14 @@ async fn canonical_global_skills_dir(fs: &dyn Fs) -> Option<PathBuf> {
     canonicalize_with_ancestors(&agent_skills::global_skills_dir(), fs).await
 }
 
+/// The canonicalized global agent data directory (`~/.agents`). This is the
+/// outside-project location agent file tools may read/write — it covers skills
+/// (`~/.agents/skills`), canvases (`~/.agents/canvases`), and any future
+/// agent-owned area.
+async fn canonical_global_agents_dir(fs: &dyn Fs) -> Option<PathBuf> {
+    canonicalize_with_ancestors(&agent_skills::global_agents_dir(), fs).await
+}
+
 fn is_within_any_worktree(canonical_path: &Path, canonical_worktree_roots: &[PathBuf]) -> bool {
     canonical_worktree_roots
         .iter()
@@ -126,24 +134,21 @@ fn is_within_any_worktree(canonical_path: &Path, canonical_worktree_roots: &[Pat
 /// global skills directory — which lives outside any worktree — without
 /// also opening up arbitrary external paths.
 pub async fn resolve_global_skill_path(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
-    let normalized_path = resolve_lexical_global_skill_path(path)?;
+    let normalized_path = resolve_lexical_global_agents_path(path)?;
 
     // Canonicalize both sides so symlinks can't sneak the path out of the
-    // skills tree (and so different but equivalent path representations
-    // match). The lexical check above intentionally runs first, so a
-    // symlinked `~/.agents/skills` root can't broaden the allowlist to every
-    // path under the symlink target. A linked immediate skill directory is
-    // allowed separately, but only for paths that stay under that skill target.
+    // agents tree (and so different but equivalent path representations match).
     let canonical_path = fs.canonicalize(&normalized_path).await.ok()?;
-    let canonical_skills_dir = canonical_global_skills_dir(fs).await?;
+    let canonical_agents_dir = canonical_global_agents_dir(fs).await?;
 
-    if canonical_path.starts_with(&canonical_skills_dir)
-        || is_in_linked_global_skill_dir(
-            &normalized_path,
-            &canonical_path,
-            &canonical_skills_dir,
-            fs,
-        )
+    if canonical_path.starts_with(&canonical_agents_dir) {
+        return Some(canonical_path);
+    }
+
+    // A skill directory symlinked outside the agents tree is still allowed, but
+    // only for paths that stay under that skill target.
+    let canonical_skills_dir = canonical_global_skills_dir(fs).await?;
+    if is_in_linked_global_skill_dir(&normalized_path, &canonical_path, &canonical_skills_dir, fs)
         .await
     {
         Some(canonical_path)
@@ -216,6 +221,30 @@ fn resolve_lexical_global_skill_path(path: &Path) -> Option<PathBuf> {
         .then_some(normalized_path)
 }
 
+/// Like [`resolve_lexical_global_skill_path`], but allows the whole `~/.agents`
+/// tree (skills, canvases, …). Expands a leading `~` and normalizes `.`/`..`
+/// before the prefix check, so a `~/.agents/...` path the model writes resolves.
+fn resolve_lexical_global_agents_path(path: &Path) -> Option<PathBuf> {
+    let normalized_path = expand_and_normalize_absolute_path(path)?;
+    let normalized_agents_dir = normalize_path(&agent_skills::global_agents_dir());
+
+    normalized_path
+        .starts_with(&normalized_agents_dir)
+        .then_some(normalized_path)
+}
+
+/// Whether `path` is `~/.agents/canvases` or a descendant. Canvas files are the
+/// agent's own rendering surface, authored through the canvas tools, so edits to
+/// them are auto-approved rather than prompted. Purely lexical (expands `~` and
+/// normalizes `.`/`..`) so it can run on the synchronous authorization fast path.
+fn is_agents_canvases_path(path: &Path) -> bool {
+    let Some(normalized_path) = expand_and_normalize_absolute_path(path) else {
+        return false;
+    };
+    let canvases_dir = normalize_path(&agent_skills::global_agents_dir()).join("canvases");
+    normalized_path.starts_with(&canvases_dir)
+}
+
 /// If `path` names `~/.agents/skills` or one of its descendants, return a
 /// canonical absolute path for it. Unlike [`resolve_global_skill_path`], the
 /// target path may or may not exist on disk yet — the caller decides whether
@@ -223,11 +252,11 @@ fn resolve_lexical_global_skill_path(path: &Path) -> Option<PathBuf> {
 /// siblings of the global skills tree or paths that would escape it with `..`
 /// or symlinks.
 pub async fn resolve_creatable_global_skill_path(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
-    let normalized_path = resolve_lexical_global_skill_path(path)?;
+    let normalized_path = resolve_lexical_global_agents_path(path)?;
     let canonical_path = canonicalize_with_ancestors(&normalized_path, fs).await?;
-    let canonical_skills_dir = canonical_global_skills_dir(fs).await?;
+    let canonical_agents_dir = canonical_global_agents_dir(fs).await?;
 
-    if canonical_path.starts_with(&canonical_skills_dir) {
+    if canonical_path.starts_with(&canonical_agents_dir) {
         Some(canonical_path)
     } else {
         None
@@ -638,6 +667,13 @@ pub fn authorize_file_edit(
 
     if let ToolPermissionDecision::Deny(reason) = decision {
         return Task::ready(Err(anyhow!("{}", reason)));
+    }
+
+    // Canvas files (`~/.agents/canvases/`) are the agent's own rendering surface,
+    // authored through the canvas tools. Auto-approve edits to them so the canvas
+    // workflow isn't interrupted by a confirmation prompt for every revision.
+    if is_agents_canvases_path(path) {
+        return Task::ready(Ok(()));
     }
 
     let path_owned = path.to_path_buf();
@@ -1051,18 +1087,21 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_resolve_creatable_global_skill_path_rejects_other_home_paths(
+    async fn test_resolve_creatable_global_skill_path_rejects_paths_outside_agents_dir(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        let sibling_path = PathBuf::from("~").join(".agents").join("not-skills");
+        // Outside `~/.agents` entirely.
+        let sibling_path = PathBuf::from("~").join("not-agents");
+        // Escapes `~/.agents` via `..`, even though it starts inside the skills tree.
         let escaped_path = PathBuf::from("~")
             .join(".agents")
             .join("skills")
             .join("..")
-            .join("not-skills");
+            .join("..")
+            .join("not-agents");
 
         assert!(
             resolve_creatable_global_skill_path(&sibling_path, fs.as_ref())

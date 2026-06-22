@@ -1199,6 +1199,10 @@
           "cancel_subagent": true,
           "terminal": true,
           "search_web": true,
+          "create_canvas": true,
+          "canvas_open": true,
+          "canvas_list": true,
+          "canvas_errors": true,
         },
       },
       "ask": {
@@ -1225,6 +1229,10 @@
           "await_subagent": true,
           "cancel_subagent": true,
           "search_web": true,
+          "create_canvas": true,
+          "canvas_open": true,
+          "canvas_list": true,
+          "canvas_errors": true,
         },
       },
       "minimal": {

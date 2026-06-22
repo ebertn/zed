@@ -2377,6 +2377,13 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Sets rectangular regions (in window logical coordinates) where native
+    /// mouse hit-testing passes through to a view layered behind the window's
+    /// rendering surface. See [`PlatformWindow::set_mouse_passthrough_rects`].
+    pub fn set_mouse_passthrough_rects(&self, rects: Vec<Bounds<Pixels>>) {
+        self.platform_window.set_mouse_passthrough_rects(rects);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

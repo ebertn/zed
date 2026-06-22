@@ -153,6 +153,10 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
+                sel!(hitTest:),
+                hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+            );
+            decl.add_method(
                 sel!(mouseUp:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -362,6 +366,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
         decl.add_method(
+            sel!(makeFirstResponder:),
+            make_first_responder as extern "C" fn(&Object, Sel, id) -> BOOL,
+        );
+
+        decl.add_method(
             sel!(canBecomeMainWindow),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
         );
@@ -523,6 +532,10 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // Rectangular regions (window logical coords, top-left origin) where
+    // `hitTest:` returns nil so native mouse events pass through to a sibling
+    // view layered behind the Metal view (e.g. an embedded WebView).
+    mouse_passthrough_rects: Vec<Bounds<Pixels>>,
 }
 
 impl MacWindowState {
@@ -912,6 +925,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                mouse_passthrough_rects: Vec::new(),
             })));
 
             (*native_window).set_ivar(
@@ -1541,6 +1555,10 @@ impl PlatformWindow for MacWindow {
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.0.as_ref().lock().background_appearance
+    }
+
+    fn set_mouse_passthrough_rects(&self, rects: Vec<Bounds<Pixels>>) {
+        self.0.as_ref().lock().mouse_passthrough_rects = rects;
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
@@ -2216,6 +2234,89 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
         }
 
         _ => NO,
+    }
+}
+
+/// Returns `nil` when `point` falls in a registered mouse-passthrough region so
+/// AppKit routes the event to a sibling view layered behind this one (an
+/// embedded WebView showing through a transparent canvas region); otherwise
+/// falls back to the default `NSView` hit test.
+extern "C" fn hit_test(this: &Object, _: Sel, location: NSPoint) -> id {
+    let window_state = unsafe { get_window_state(this) };
+    // `location` is in the superview (contentView) coordinate system, which
+    // matches the GPUI window origin. AppKit uses a bottom-left origin while
+    // GPUI uses top-left, so flip Y against the content height.
+    let passthrough = window_state
+        .try_lock()
+        .map(|lock| {
+            if lock.mouse_passthrough_rects.is_empty() {
+                return false;
+            }
+            let height = lock.content_size().height;
+            let gpui_point = point(px(location.x as f32), height - px(location.y as f32));
+            lock.mouse_passthrough_rects
+                .iter()
+                .any(|rect| rect.contains(&gpui_point))
+        })
+        .unwrap_or(false);
+
+    if passthrough {
+        nil
+    } else {
+        unsafe { msg_send![super(this, class!(NSView)), hitTest: location] }
+    }
+}
+
+/// Controls whether an embedded WKWebView (or a descendant) may become the
+/// window's first responder. We refuse *programmatic* focus grabs — WebKit
+/// focuses its web content when a page loads, which would steal keyboard input
+/// from Zed (typing then beeps). But we *allow* the grab while the user is
+/// actively pressing a mouse button, so click/drag text selection inside the
+/// canvas still works. After such a selection the WebView holds focus until the
+/// user clicks back into Zed, which is the normal AppKit behavior. GPUI's own
+/// views never descend from a WKWebView, so they are unaffected.
+extern "C" fn make_first_responder(this: &Object, _: Sel, responder: id) -> BOOL {
+    unsafe {
+        if !responder.is_null()
+            && responder_within_webview(responder)
+            && !mouse_button_pressed()
+        {
+            return NO;
+        }
+        msg_send![super(this, class!(NSWindow)), makeFirstResponder: responder]
+    }
+}
+
+/// Whether any mouse button is currently held down. Distinguishes a user-driven
+/// focus change (click/drag) from a programmatic one (page load).
+unsafe fn mouse_button_pressed() -> bool {
+    unsafe {
+        let buttons: u64 = msg_send![class!(NSEvent), pressedMouseButtons];
+        buttons != 0
+    }
+}
+
+/// Whether `responder` is, or is a descendant view of, a WKWebView. Safe for any
+/// NSResponder: non-NSView responders and views without a WebView ancestor
+/// return false.
+unsafe fn responder_within_webview(responder: id) -> bool {
+    unsafe {
+        let Some(webview_class) = Class::get("WKWebView") else {
+            return false;
+        };
+        let is_view: BOOL = msg_send![responder, isKindOfClass: class!(NSView)];
+        if is_view == NO {
+            return false;
+        }
+        let mut view = responder;
+        while !view.is_null() {
+            let is_webview: BOOL = msg_send![view, isKindOfClass: webview_class];
+            if is_webview == YES {
+                return true;
+            }
+            view = msg_send![view, superview];
+        }
+        false
     }
 }
 
