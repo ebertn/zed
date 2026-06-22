@@ -233,6 +233,18 @@ fn resolve_lexical_global_agents_path(path: &Path) -> Option<PathBuf> {
         .then_some(normalized_path)
 }
 
+/// Whether `path` is `~/.agents/canvases` or a descendant. Canvas files are the
+/// agent's own rendering surface, authored through the canvas tools, so edits to
+/// them are auto-approved rather than prompted. Purely lexical (expands `~` and
+/// normalizes `.`/`..`) so it can run on the synchronous authorization fast path.
+fn is_agents_canvases_path(path: &Path) -> bool {
+    let Some(normalized_path) = expand_and_normalize_absolute_path(path) else {
+        return false;
+    };
+    let canvases_dir = normalize_path(&agent_skills::global_agents_dir()).join("canvases");
+    normalized_path.starts_with(&canvases_dir)
+}
+
 /// If `path` names `~/.agents/skills` or one of its descendants, return a
 /// canonical absolute path for it. Unlike [`resolve_global_skill_path`], the
 /// target path may or may not exist on disk yet — the caller decides whether
@@ -655,6 +667,13 @@ pub fn authorize_file_edit(
 
     if let ToolPermissionDecision::Deny(reason) = decision {
         return Task::ready(Err(anyhow!("{}", reason)));
+    }
+
+    // Canvas files (`~/.agents/canvases/`) are the agent's own rendering surface,
+    // authored through the canvas tools. Auto-approve edits to them so the canvas
+    // workflow isn't interrupted by a confirmation prompt for every revision.
+    if is_agents_canvases_path(path) {
+        return Task::ready(Ok(()));
     }
 
     let path_owned = path.to_path_buf();
