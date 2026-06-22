@@ -92,7 +92,6 @@ pub fn init(cx: &mut App) {
         thread.add_tool(CanvasOpenTool {
             session_id: thread.id().clone(),
         });
-        thread.add_tool(CanvasUpdateTool);
         thread.add_tool(CanvasListTool);
         thread.add_tool(CanvasFocusTool);
         thread.add_tool(CanvasErrorsTool);
@@ -342,14 +341,26 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Scaffolds the project and writes `content` to
-/// `~/.agents/canvases/<slug>.canvas.tsx`, returning the file path.
-fn prepare_canvas_file(title: &str, content: &str) -> Result<PathBuf> {
+/// Scaffolds the project (tsconfig + ambient types) and ensures
+/// `~/.agents/canvases/<slug>.canvas.tsx` exists, writing `default_content` only
+/// if the file is new (an existing canvas with the same title is left intact so
+/// it can be reopened by identifier). Returns the file path.
+fn prepare_canvas_file(title: &str, default_content: &str) -> Result<PathBuf> {
     scaffold_canvas_project();
     let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(title)));
-    std::fs::write(&path, content)
-        .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))?;
+    if !path.exists() {
+        std::fs::write(&path, default_content)
+            .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))?;
+    }
     Ok(path)
+}
+
+/// A minimal starter canvas written when opening a title that doesn't exist yet.
+fn starter_canvas(title: &str) -> String {
+    let heading = title.replace(['{', '}'], "");
+    format!(
+        "function Canvas() {{\n  return (\n    <Page>\n      <h1>{heading}</h1>\n      <p>Edit this file to build the canvas.</p>\n    </Page>\n  );\n}}\n"
+    )
 }
 
 /// Opens a canvas viewer for `path` in the active workspace (from an `&mut App`).
@@ -438,15 +449,21 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 
 // --- Agent tools -------------------------------------------------------------
 
-/// Opens a new canvas: a panel that renders a React component to present
+/// Opens a canvas: a panel that renders a React component to present
 /// information to the user (reports, dashboards, summaries, charts).
 ///
-/// `content` is JSX that defines a top-level `function Canvas() { ... }` returning
-/// the UI. IMPORTANT RULES:
+/// Canvases are files. This tool opens the canvas for `title` (creating a
+/// starter file if one doesn't exist yet) and returns its file path. You then
+/// author it by editing that `.canvas.tsx` file directly with your normal file
+/// tools (`edit_file`) — it hot-reloads on save. Re-opening the same title
+/// reopens the existing file. Lint your edits with the `diagnostics` tool, and
+/// call `canvas_errors` to confirm it renders.
+///
+/// The file must define exactly one top-level `function Canvas() { ... }`
+/// returning the UI. IMPORTANT RULES for its contents:
 /// - Do NOT use `import` or `export`, and do NOT write TypeScript type
 ///   annotations. React and the component library are provided as globals and
 ///   only JSX is transpiled.
-/// - Define exactly one top-level `function Canvas()` — it is what gets rendered.
 ///
 /// Components available as globals (no import needed):
 /// - `<Page>…</Page>`: root wrapper with readable typography (Tailwind `prose`).
@@ -463,29 +480,11 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 /// You may also use Tailwind utility classes via `className="…"` for layout/color.
 /// Keep it clean and readable: neutral grays, a single accent color, no gradients
 /// or drop shadows.
-///
-/// Example `content`:
-/// function Canvas() {
-///   return (
-///     <Page>
-///       <h1>Q3 summary</h1>
-///       <p>Revenue grew while churn fell.</p>
-///       <Grid cols={2}>
-///         <Card title="Revenue"><Stat label="Q3" value="$1.2M" delta="+8%" tone="up" /></Card>
-///         <Card title="Churn"><Stat label="Q3" value="2.1%" delta="-0.4pt" tone="down" /></Card>
-///       </Grid>
-///       <BarChart data={[{label:"Jul",value:30},{label:"Aug",value:42},{label:"Sep",value:51}]} />
-///     </Page>
-///   );
-/// }
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasOpenToolInput {
-    /// Short title shown on the canvas tab.
+    /// Short title shown on the canvas tab. Also identifies the canvas: opening
+    /// the same title reopens the same file.
     title: String,
-    /// JSX defining a top-level `function Canvas() { ... }` (see the tool
-    /// description for the rules and available components). No imports/exports,
-    /// no TypeScript types.
-    content: String,
 }
 
 struct CanvasOpenTool {
@@ -524,8 +523,10 @@ impl AgentTool for CanvasOpenTool {
         let session_id = self.session_id.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|err| err.to_string())?;
-            let path =
-                prepare_canvas_file(&input.title, &input.content).map_err(|err| err.to_string())?;
+            // Create a starter file only if this canvas doesn't exist yet; an
+            // existing canvas with the same title is reopened as-is.
+            let path = prepare_canvas_file(&input.title, &starter_canvas(&input.title))
+                .map_err(|err| err.to_string())?;
             // Make the canvases dir a (non-visible) worktree so `edit_file` and the
             // language server work on the file before the agent edits it.
             ensure_canvas_worktree(cx).await.map_err(|err| err.to_string())?;
@@ -549,7 +550,7 @@ impl AgentTool for CanvasOpenTool {
                 );
             });
             Ok(format!(
-                "Opened canvas \"{}\" (id {}). It is the file `{}` — edit that file directly with your normal file tools to iterate (it hot-reloads on save). After creating or editing it, call `canvas_errors` with id {} to verify it renders without errors.",
+                "Opened canvas \"{}\" (id {}). It is the file `{}` — author it by editing that file directly with `edit_file` (it hot-reloads on save). Lint your edits with `diagnostics`, then call `canvas_errors` with id {} to confirm it renders without errors.",
                 input.title,
                 id.0,
                 path.display(),
@@ -559,63 +560,8 @@ impl AgentTool for CanvasOpenTool {
     }
 }
 
-/// Replaces the content of an existing canvas, identified by id.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-struct CanvasUpdateToolInput {
-    /// The id of the canvas to update (from `canvas_open` or `canvas_list`).
-    id: u64,
-    /// The new canvas body: JSX defining a top-level `function Canvas() { ... }`,
-    /// same format as `canvas_open` (no imports/exports, no TypeScript types).
-    content: String,
-}
-
-struct CanvasUpdateTool;
-
-impl AgentTool for CanvasUpdateTool {
-    type Input = CanvasUpdateToolInput;
-    type Output = String;
-
-    const NAME: &'static str = "canvas_update";
-
-    fn kind() -> acp::ToolKind {
-        acp::ToolKind::Other
-    }
-
-    fn initial_title(
-        &self,
-        input: Result<Self::Input, serde_json::Value>,
-        _cx: &mut App,
-    ) -> SharedString {
-        match input {
-            Ok(input) => format!("Update canvas {}", input.id).into(),
-            Err(_) => "Update canvas".into(),
-        }
-    }
-
-    fn run(
-        self: Arc<Self>,
-        input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
-        cx: &mut App,
-    ) -> Task<Result<Self::Output, Self::Output>> {
-        cx.spawn(async move |cx| {
-            let input = input.recv().await.map_err(|err| err.to_string())?;
-            cx.update(|cx| {
-                surface::update_surface(
-                    "canvas",
-                    SurfaceId(input.id),
-                    serde_json::json!({ "content": input.content }),
-                    cx,
-                )
-            })
-            .map_err(|err| err.to_string())?;
-            Ok(format!("Updated canvas {}.", input.id))
-        })
-    }
-}
-
 /// Lists the open canvases as JSON `[{ "id", "title" }]` so the agent can decide
-/// which one to update.
+/// which one to focus.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasListToolInput {}
 
