@@ -102,7 +102,7 @@ impl AgentTool for CancelSubagentTool {
                     error: e.to_string(),
                 })?;
 
-            let session_id = input.session_id.clone();
+            let session_id = input.session_id;
             let result = cx.update(|cx| self.environment.cancel_subagent(session_id.clone(), cx));
 
             match result {
