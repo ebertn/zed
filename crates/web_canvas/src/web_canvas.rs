@@ -288,6 +288,21 @@ fn scaffold_canvas_project() {
     if let Err(err) = std::fs::write(&dts, CANVAS_DTS) {
         log::error!("canvas: failed to write canvas.d.ts: {err}");
     }
+    // Disable the eslint language server for this scaffold: it auto-starts for
+    // `.tsx` files but there is no ESLint installed here (no `node_modules`), so
+    // it only emits a noisy "eslint/noLibrary" failure. Canvas type support comes
+    // from vtsls + the scaffolded tsconfig, so eslint adds nothing.
+    let zed_dir = dir.join(".zed");
+    if let Err(err) = std::fs::create_dir_all(&zed_dir) {
+        log::error!("canvas: failed to create {}: {err}", zed_dir.display());
+        return;
+    }
+    let settings = zed_dir.join("settings.json");
+    if !settings.exists()
+        && let Err(err) = std::fs::write(&settings, CANVAS_ZED_SETTINGS)
+    {
+        log::error!("canvas: failed to write .zed/settings.json: {err}");
+    }
 }
 
 fn slugify(title: &str) -> String {
@@ -1623,6 +1638,18 @@ const TSCONFIG_JSON: &str = r##"{
     "types": []
   },
   "include": ["*.tsx", "*.d.ts"]
+}
+"##;
+
+/// `.zed/settings.json` written into `~/.agents/canvases/` to disable the eslint
+/// language server for canvas files. Zed auto-starts eslint for `.tsx`, but the
+/// scaffold has no ESLint installed, so it only emits a noisy failure. `"..."`
+/// keeps the remaining default servers (vtsls, tailwind) intact.
+const CANVAS_ZED_SETTINGS: &str = r##"{
+  "languages": {
+    "TSX": { "language_servers": ["!eslint", "..."] },
+    "TypeScript": { "language_servers": ["!eslint", "..."] }
+  }
 }
 "##;
 
