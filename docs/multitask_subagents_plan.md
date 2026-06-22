@@ -34,6 +34,15 @@ Base: `origin/main`
   `enabled_tools` when off) and `max_concurrent_background_subagents` (default 8;
   `spawn_agent_background` returns a clear error once that many are already
   running). Defined in `settings_content`/`agent_settings`/`default.json`.
+- [x] **Phase 7 (persistence across restart)**: the background-subagent registry is
+  persisted in `DbThread` (session id, label, status, output/error, delivered) and
+  restored in `Thread::from_db`. Subagents and their results survive a restart and
+  stay listable; ones that were running are restored as **interrupted** (their
+  driver can't survive a restart). `BackgroundSubagent.thread`/`driver` are now
+  optional to represent restored-but-not-live entries.
+  - [ ] Follow-up: messaging/resuming a subagent created in a *previous* session
+    requires async-loading its session in the resume path; not yet wired, so
+    restored subagents are visible but not yet resumable until reopened.
 - [x] **Phase 4 (edit-safety — WriteCoordinator)**: concurrent edits across all
   agents (primary + background subagents) are now serialized per buffer. A
   `WriteCoordinator` app-global maps each buffer's `EntityId` to an
