@@ -14,8 +14,8 @@
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Task, WeakEntity, Window, WindowBackgroundAppearance, actions,
-    canvas, div,
+    SharedString, Styled as _, Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance,
+    actions, canvas, div,
 };
 use workspace::{Item, Workspace};
 
@@ -119,18 +119,42 @@ struct CanvasRegistry {
     next_id: u64,
     last_focused: Option<u64>,
     instances: HashMap<u64, WeakEntity<CanvasView>>,
+    /// Release observers (keyed by canvas id) that deregister a canvas and
+    /// recompute its window's transparency when its tab is closed.
+    release_subscriptions: HashMap<u64, Subscription>,
 }
 
 impl Global for CanvasRegistry {}
 
-fn register_canvas(view: &Entity<CanvasView>, cx: &mut App) -> u64 {
+fn register_canvas(view: &Entity<CanvasView>, window: AnyWindowHandle, cx: &mut App) -> u64 {
     if !cx.has_global::<CanvasRegistry>() {
         cx.set_global(CanvasRegistry::default());
     }
-    let registry = cx.global_mut::<CanvasRegistry>();
-    let id = registry.next_id;
-    registry.next_id += 1;
-    registry.instances.insert(id, view.downgrade());
+    let id = {
+        let registry = cx.global_mut::<CanvasRegistry>();
+        let id = registry.next_id;
+        registry.next_id += 1;
+        registry.instances.insert(id, view.downgrade());
+        id
+    };
+
+    // When the canvas tab is closed (the view is released), drop it from the
+    // registry and restore the window to opaque if it was the last canvas there.
+    let subscription = cx.observe_release(view, move |_view, cx| {
+        if let Some(registry) = try_global_mut::<CanvasRegistry>(cx) {
+            registry.instances.remove(&id);
+            registry.release_subscriptions.remove(&id);
+            if registry.last_focused == Some(id) {
+                registry.last_focused = None;
+            }
+        }
+        refresh_window_transparency(window, cx);
+    });
+    cx.global_mut::<CanvasRegistry>()
+        .release_subscriptions
+        .insert(id, subscription);
+
+    refresh_window_transparency(window, cx);
     id
 }
 
@@ -154,6 +178,33 @@ fn live_canvases(cx: &App) -> Vec<(u64, SharedString)> {
         .collect();
     canvases.sort_by_key(|(id, _)| *id);
     canvases
+}
+
+/// Whether `window` currently hosts at least one live canvas.
+fn window_has_live_canvas(window: AnyWindowHandle, cx: &App) -> bool {
+    let Some(registry) = cx.try_global::<CanvasRegistry>() else {
+        return false;
+    };
+    registry.instances.values().any(|weak| {
+        weak.upgrade()
+            .is_some_and(|view| view.read(cx).window_handle == window)
+    })
+}
+
+/// Makes `window`'s surface non-opaque while it hosts a canvas (so the WebView
+/// shows through the punched transparency hole) and restores it to opaque once
+/// the last canvas closes (to regain the direct-to-display fast path).
+fn refresh_window_transparency(window: AnyWindowHandle, cx: &mut App) {
+    let appearance = if window_has_live_canvas(window, cx) {
+        WindowBackgroundAppearance::Transparent
+    } else {
+        WindowBackgroundAppearance::Opaque
+    };
+    if let Err(err) = window.update(cx, |_root, window, _cx| {
+        window.set_background_appearance(appearance);
+    }) {
+        log::error!("canvas: failed to update window transparency: {err}");
+    }
 }
 
 // --- Surface provider --------------------------------------------------------
@@ -193,7 +244,7 @@ impl SurfaceProvider for CanvasProvider {
         workspace.active_pane().update(cx, |pane, cx| {
             pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
         });
-        let id = register_canvas(&view, cx);
+        let id = register_canvas(&view, window.window_handle(), cx);
         Ok(SurfaceId(id))
     }
 
@@ -603,6 +654,9 @@ struct CanvasView {
     title: SharedString,
     path: PathBuf,
     focus_handle: FocusHandle,
+    // The window this canvas lives in, used to scope transparency to windows
+    // that actually host a canvas.
+    window_handle: AnyWindowHandle,
     // The current full HTML document, shared with the WebView's custom-protocol
     // handler so updates just mutate this and reload.
     #[cfg(target_os = "macos")]
@@ -624,6 +678,7 @@ impl CanvasView {
         cx: &mut Context<Self>,
     ) -> Self {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let window_handle = window.window_handle();
         #[cfg(target_os = "macos")]
         let document = Rc::new(RefCell::new(canvas_document(title.as_ref(), &content)));
         #[cfg(target_os = "macos")]
@@ -634,6 +689,7 @@ impl CanvasView {
             title,
             path,
             focus_handle: cx.focus_handle(),
+            window_handle,
             #[cfg(target_os = "macos")]
             document,
             #[cfg(target_os = "macos")]
@@ -835,11 +891,10 @@ fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry:
             // The WebView is a sibling of GPUI's Metal view under `contentView`.
             // `new_as_child` stacks it *above* the Metal view, which would cover
             // GPUI's menus and overlays. Instead, layer it *below* the Metal
-            // view and make the window's surface non-opaque, so the WebView only
-            // shows through where the canvas tab punches a transparency hole
-            // (see `CanvasView::render`); everything GPUI draws then composites
-            // on top.
-            window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+            // view so the WebView only shows through where the canvas tab
+            // punches a transparency hole (see `CanvasView::render`); everything
+            // GPUI draws then composites on top. The window's surface is made
+            // non-opaque separately by `refresh_window_transparency`.
             order_webview_below_native_view(window);
             Some(webview)
         }
