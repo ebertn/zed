@@ -40,9 +40,18 @@ Base: `origin/main`
   stay listable; ones that were running are restored as **interrupted** (their
   driver can't survive a restart). `BackgroundSubagent.thread`/`driver` are now
   optional to represent restored-but-not-live entries.
-  - [ ] Follow-up: messaging/resuming a subagent created in a *previous* session
-    requires async-loading its session in the resume path; not yet wired, so
-    restored subagents are visible but not yet resumable until reopened.
+  - The **subagent tool-call card is fully restored** after a restart (transcript,
+    expand, full-screen). On open, `ConversationView::initial_state` scans the
+    reopened thread's tool calls for `subagent_session_info` and calls
+    `load_subagent_session` for each, reloading the subagent's `ThreadView` (the
+    replay path alone can't — `open_thread` drains replay before the view
+    subscribes, so the `SubagentSpawned` event is missed). The spawn tool's
+    `replay` also re-emits `subagent_spawned` for the live path.
+  - Restored subagents are marked delivered so they never trigger a spurious
+    auto-pull "[Automatic update]" after a restart.
+  - [ ] Follow-up: nested subagents (a subagent's own subagents) aren't recursively
+    reloaded; messaging/resuming a restored subagent across sessions still depends
+    on its session being loaded (now true for direct subagents of the root thread).
 - [x] **Phase 4 (edit-safety — WriteCoordinator)**: concurrent edits across all
   agents (primary + background subagents) are now serialized per buffer. A
   `WriteCoordinator` app-global maps each buffer's `EntityId` to an

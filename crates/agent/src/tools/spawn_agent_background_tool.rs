@@ -236,4 +236,40 @@ impl AgentTool for SpawnAgentBackgroundTool {
             })
         })
     }
+
+    fn replay(
+        &self,
+        _input: Self::Input,
+        output: Self::Output,
+        event_stream: ToolCallEventStream,
+        _cx: &mut App,
+    ) -> Result<()> {
+        let (content, session_info) = match output {
+            SpawnAgentBackgroundToolOutput::Started {
+                message,
+                session_info,
+                ..
+            } => (message, Some(session_info)),
+            SpawnAgentBackgroundToolOutput::Error { error, .. } => (error, None),
+        };
+
+        // Re-announce the subagent so its session is reloaded after a restart,
+        // restoring the tool-call card's transcript / expand / full-screen.
+        if let Some(session_info) = &session_info {
+            event_stream.subagent_spawned(session_info.session_id.clone());
+        }
+
+        let meta = session_info.map(|session_info| {
+            acp::Meta::from_iter([(
+                SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::json!(&session_info),
+            )])
+        });
+        event_stream.update_fields_with_meta(
+            acp::ToolCallUpdateFields::new().content(vec![content.into()]),
+            meta,
+        );
+
+        Ok(())
+    }
 }
