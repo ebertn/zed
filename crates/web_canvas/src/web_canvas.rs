@@ -500,6 +500,10 @@ fn try_global_mut<G: Global>(cx: &mut App) -> Option<&mut G> {
 ///   `<Pie>`, `<Cell>`, `<XAxis>`, `<YAxis>`, `<CartesianGrid>`, `<Tooltip>`,
 ///   `<Legend>` (also the full `Recharts` namespace). Wrap a chart in a sized
 ///   `<div style={{ width: "100%", height: 240 }}>` with `<ResponsiveContainer>`.
+///   Color series with the theme palette so charts match the rest of the UI:
+///   use `fill`/`stroke="hsl(var(--chart-1))"` (matches the primary/button color)
+///   through `hsl(var(--chart-5))`, and `hsl(var(--border))`/
+///   `hsl(var(--muted-foreground))` for grid/axes. Do NOT hardcode hex colors.
 /// - Icons (lucide): e.g. `<TrendingUp />`, `<Check />`, `<Info />` (also the
 ///   `Icons` namespace).
 /// - `useHostTheme()` -> `{ kind: "light" | "dark", name: string | null, colors: Record<string, string> }`.
@@ -1378,6 +1382,24 @@ fn canvas_theme_json(cx: &App) -> String {
         "dark"
     };
 
+    // Derive a visibly-distinct "subtle surface" for shadcn's secondary/muted/
+    // accent tokens by nudging the background's lightness toward the foreground
+    // (lighter in dark themes, darker in light themes). Mapping these straight to
+    // a Zed element color tends to vanish into the background.
+    let dark = !theme.appearance().is_light();
+    let elevate = |base: gpui::Hsla, amount: f32| gpui::Hsla {
+        l: (base.l + amount).clamp(0.0, 1.0),
+        ..base
+    };
+    let subtle_surface = elevate(colors.background, if dark { 0.10 } else { -0.06 });
+    // A chart palette anchored on the accent so the first series matches the
+    // primary (button) color; later series rotate hue for distinction.
+    let accent = colors.text_accent;
+    let chart = |steps: f32| gpui::Hsla {
+        h: (accent.h + steps * 0.11).rem_euclid(1.0),
+        ..accent
+    };
+
     serde_json::json!({
         "kind": kind,
         "name": theme.name.to_string(),
@@ -1406,17 +1428,22 @@ fn canvas_theme_json(cx: &App) -> String {
             "popover-foreground": hsl_triplet(colors.text),
             "primary": hsl_triplet(colors.text_accent),
             "primary-foreground": hsl_triplet(colors.background),
-            "secondary": hsl_triplet(colors.element_background),
+            "secondary": hsl_triplet(subtle_surface),
             "secondary-foreground": hsl_triplet(colors.text),
-            "muted": hsl_triplet(colors.element_background),
+            "muted": hsl_triplet(subtle_surface),
             "muted-foreground": hsl_triplet(colors.text_muted),
-            "accent": hsl_triplet(colors.element_background),
+            "accent": hsl_triplet(subtle_surface),
             "accent-foreground": hsl_triplet(colors.text),
             "destructive": hsl_triplet(status.error),
             "destructive-foreground": hsl_triplet(colors.background),
             "border": hsl_triplet(colors.border),
             "input": hsl_triplet(colors.border),
             "ring": hsl_triplet(colors.text_accent),
+            "chart-1": hsl_triplet(chart(0.0)),
+            "chart-2": hsl_triplet(chart(1.0)),
+            "chart-3": hsl_triplet(chart(2.0)),
+            "chart-4": hsl_triplet(chart(3.0)),
+            "chart-5": hsl_triplet(chart(4.0)),
         }
     })
     .to_string()
