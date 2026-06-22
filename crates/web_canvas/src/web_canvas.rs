@@ -14,8 +14,8 @@
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Global, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Task, WeakEntity, Window, WindowBackgroundAppearance,
-    actions, canvas, div,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity,
+    Window, WindowBackgroundAppearance, actions, canvas, div,
 };
 use workspace::{Item, Workspace};
 
@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use surface::{SurfaceId, SurfaceProvider};
+use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple};
 
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, rc::Rc};
@@ -650,6 +651,15 @@ impl AgentTool for CanvasFocusTool {
 
 // --- The canvas view (a workspace Item) --------------------------------------
 
+/// What the canvas tab is currently showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CanvasMode {
+    /// The rendered WebView output.
+    Rendered,
+    /// The `.canvas.tsx` source that produced it, for inspection.
+    Code,
+}
+
 struct CanvasView {
     title: SharedString,
     path: PathBuf,
@@ -657,6 +667,11 @@ struct CanvasView {
     // The window this canvas lives in, used to scope transparency to windows
     // that actually host a canvas.
     window_handle: AnyWindowHandle,
+    // Whether the tab shows the rendered canvas or its source.
+    mode: CanvasMode,
+    // The current `.canvas.tsx` source, shown in `CanvasMode::Code` and kept in
+    // sync with the file (and agent edits) via the watch task.
+    source: String,
     // The current full HTML document, shared with the WebView's custom-protocol
     // handler so updates just mutate this and reload.
     #[cfg(target_os = "macos")]
@@ -706,6 +721,8 @@ impl CanvasView {
             path,
             focus_handle: cx.focus_handle(),
             window_handle,
+            mode: CanvasMode::Rendered,
+            source: content,
             #[cfg(target_os = "macos")]
             document,
             #[cfg(target_os = "macos")]
@@ -749,7 +766,11 @@ impl CanvasView {
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    fn set_content(&mut self, content: &str, _cx: &mut Context<Self>) {
+    fn set_content(&mut self, content: &str, cx: &mut Context<Self>) {
+        self.source = content.to_string();
+        // Refresh the code view if it's showing; the WebView reload below covers
+        // the rendered view.
+        cx.notify();
         #[cfg(target_os = "macos")]
         {
             *self.document.borrow_mut() =
@@ -760,6 +781,24 @@ impl CanvasView {
                 log::error!("canvas: load_url failed: {err}");
             }
         }
+    }
+
+    /// Switches between the rendered canvas and its source. Hides the WebView in
+    /// code mode so the (opaque) code view isn't drawn over a live WebView; the
+    /// rendered mode's `canvas()` positioner shows it again on switch back.
+    fn set_mode(&mut self, mode: CanvasMode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        #[cfg(target_os = "macos")]
+        if mode == CanvasMode::Code
+            && let Some(webview) = self.webview.as_ref()
+            && let Err(err) = webview.set_visible(false)
+        {
+            log::error!("canvas: set_visible(false) failed: {err}");
+        }
+        cx.notify();
     }
 
     /// Rebuilds the document with the latest host theme and reloads the WebView.
@@ -778,33 +817,108 @@ impl CanvasView {
 }
 
 impl Render for CanvasView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Paint a transparency hole rather than a solid background: this clears
-        // the window's surface to alpha 0 over the canvas rect so the WebView
-        // (layered behind GPUI's Metal view) shows through, while GPUI overlays
-        // such as context menus still composite on top. See `attach_webview`.
-        let root = div()
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .bg(gpui::transparency_hole());
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let root = div().track_focus(&self.focus_handle).size_full().relative();
 
-        // On macOS, overlay a `canvas()` element that reports its bounds each
-        // frame so we can keep the native WebView aligned with the tab.
-        #[cfg(target_os = "macos")]
-        let root = {
-            let webview = self.webview.clone();
-            root.child(
-                canvas(
-                    |_bounds, _window, _cx| {},
-                    move |bounds: Bounds<Pixels>, _, _window, _cx| {
-                        position_webview(webview.as_ref(), bounds);
-                    },
-                )
-                .size_full(),
-            )
+        let root = match self.mode {
+            // Paint a transparency hole rather than a solid background: this
+            // clears the window's surface to alpha 0 over the canvas rect so the
+            // WebView (layered behind GPUI's Metal view) shows through, while
+            // GPUI overlays (this toggle, context menus) composite on top. See
+            // `attach_webview`.
+            CanvasMode::Rendered => {
+                let root = root.bg(gpui::transparency_hole());
+                // On macOS, overlay a `canvas()` element that reports its bounds
+                // each frame so we keep the native WebView aligned with the tab.
+                #[cfg(target_os = "macos")]
+                let root = {
+                    let webview = self.webview.clone();
+                    root.child(
+                        canvas(
+                            |_bounds, _window, _cx| {},
+                            move |bounds: Bounds<Pixels>, _, _window, _cx| {
+                                position_webview(webview.as_ref(), bounds);
+                            },
+                        )
+                        .size_full(),
+                    )
+                };
+                root
+            }
+            CanvasMode::Code => root.child(self.render_code_view(cx)),
         };
 
-        root
+        root.child(self.render_mode_toggle(cx))
+    }
+}
+
+impl CanvasView {
+    /// The floating Canvas/Code toggle, anchored top-right over the content.
+    fn render_mode_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use theme::ActiveTheme as _;
+
+        let view = cx.entity();
+        let selected_index = match self.mode {
+            CanvasMode::Rendered => 0,
+            CanvasMode::Code => 1,
+        };
+        let toggle = ToggleButtonGroup::single_row(
+            "canvas-mode",
+            [
+                ToggleButtonSimple::new("Canvas", {
+                    let view = view.clone();
+                    move |_, _window, cx| {
+                        view.update(cx, |this, cx| this.set_mode(CanvasMode::Rendered, cx));
+                    }
+                }),
+                ToggleButtonSimple::new("Code", move |_, _window, cx| {
+                    view.update(cx, |this, cx| this.set_mode(CanvasMode::Code, cx));
+                }),
+            ],
+        )
+        .style(ToggleButtonGroupStyle::Filled)
+        .label_size(LabelSize::Small)
+        .selected_index(selected_index)
+        .auto_width();
+
+        div()
+            .absolute()
+            .top_2()
+            .right_2()
+            .rounded_md()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(toggle)
+    }
+
+    /// A scrollable, read-only view of the `.canvas.tsx` source.
+    fn render_code_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use settings::Settings as _;
+        use theme::ActiveTheme as _;
+
+        let colors = cx.theme().colors();
+        let buffer_font = theme_settings::ThemeSettings::get_global(cx)
+                .buffer_font
+                .clone();
+
+        div()
+            .id("canvas-code-view")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(colors.editor_background)
+            .text_color(colors.text)
+            .font(buffer_font)
+            .text_size(gpui::px(12.0))
+            .px_4()
+            .py_3()
+            .children(self.source.lines().map(|line| {
+                // Render each line as its own element so newlines are preserved;
+                // blank lines keep a non-breaking space to retain their height.
+                div().child(if line.is_empty() {
+                    SharedString::from("\u{00a0}")
+                } else {
+                    SharedString::from(line.to_string())
+                })
+            }))
     }
 }
 

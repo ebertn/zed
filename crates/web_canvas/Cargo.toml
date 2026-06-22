@@ -21,6 +21,8 @@ serde_json.workspace = true
 settings.workspace = true
 surface.workspace = true
 theme.workspace = true
+theme_settings.workspace = true
+ui.workspace = true
 workspace.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -21675,6 +21675,8 @@ dependencies = [
  "settings",
  "surface",
  "theme",
+ "theme_settings",
+ "ui",
  "workspace",
  "wry",
 ]
