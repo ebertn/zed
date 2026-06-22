@@ -133,21 +133,6 @@ fn register_canvas(view: &Entity<CanvasView>, window: AnyWindowHandle, cx: &mut 
     // WebView behind the transparency hole). Defer so the refresh runs once the
     // window borrow has been released and the handle resolves again.
     cx.defer(move |cx| refresh_window_transparency(window, cx));
-
-    // The deferred refresh above runs in the same event-loop turn the WebView is
-    // attached. On a cold first open that initial application doesn't reliably
-    // make the window composite as non-opaque (closing and reopening the tab
-    // forced it). Re-apply once more after the attach + first paint have settled,
-    // which goes through `window.refresh()` again; this makes the first open
-    // render without the manual close/reopen.
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .timer(Duration::from_millis(200))
-            .await;
-        // Best-effort: if the window or app is gone by now, there's nothing to do.
-        let _ = cx.update(|cx| refresh_window_transparency(window, cx));
-    })
-    .detach();
     id
 }
 
@@ -837,11 +822,20 @@ impl CanvasView {
         // Redraw the view on every page-render signal. The first signal arrives
         // once the WebView has actually painted, which recomposites the
         // transparency hole over real content instead of a black, unpainted view.
+        // On that first paint we also re-apply the window transparency: the
+        // initial application (in the same turn the WebView is attached) doesn't
+        // make a cold window composite as non-opaque, but re-applying once real
+        // content exists does. Tying it to the paint signal avoids a fixed
+        // "settle" delay.
         #[cfg(target_os = "macos")]
         let render_task = cx.spawn(async move |this, cx| {
+            let mut first_paint = true;
             while render_rx.next().await.is_some() {
                 if this.update(cx, |_this, cx| cx.notify()).is_err() {
                     break;
+                }
+                if std::mem::take(&mut first_paint) {
+                    cx.update(|cx| refresh_window_transparency(window_handle, cx));
                 }
             }
         });
