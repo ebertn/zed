@@ -1047,18 +1047,8 @@ impl ConversationView {
                         // Subagent sessions referenced by this thread's tool
                         // calls, so we can reopen them after a restart and
                         // restore their cards (transcript / expand / full-screen).
-                        let subagent_session_ids: Vec<acp::SessionId> = thread
-                            .read(cx)
-                            .entries()
-                            .iter()
-                            .filter_map(|entry| match entry {
-                                acp_thread::AgentThreadEntry::ToolCall(tool_call) => tool_call
-                                    .subagent_session_info
-                                    .as_ref()
-                                    .map(|info| info.session_id.clone()),
-                                _ => None,
-                            })
-                            .collect();
+                        let subagent_session_ids =
+                            Self::subagent_session_ids(thread.read(cx));
 
                         let conversation = cx.new(|cx| {
                             let mut conversation = Conversation::default();
@@ -1996,6 +1986,23 @@ impl ConversationView {
         }));
     }
 
+    /// Session IDs of subagents referenced by a thread's tool calls, used to
+    /// reopen them after a restart and restore their cards (transcript /
+    /// expand / full-screen).
+    fn subagent_session_ids(thread: &acp_thread::AcpThread) -> Vec<acp::SessionId> {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::ToolCall(tool_call) => tool_call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|info| info.session_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn load_subagent_session(
         &mut self,
         subagent_id: acp::SessionId,
@@ -2040,6 +2047,10 @@ impl ConversationView {
                     return;
                 };
                 let subagent_session_id = subagent_thread.read(cx).session_id().clone();
+                // Nested subagents this subagent itself spawned, so we can
+                // restore their cards too (the scan in `initial_state` only
+                // covers the root thread's direct subagents).
+                let nested_session_ids = Self::subagent_session_ids(subagent_thread.read(cx));
                 conversation.update(cx, |conversation, cx| {
                     conversation.register_thread(subagent_thread.clone(), cx);
                 });
@@ -2048,7 +2059,16 @@ impl ConversationView {
                 let Some(connected) = this.as_connected_mut() else {
                     return;
                 };
-                connected.threads.insert(subagent_session_id, view);
+                connected.threads.insert(subagent_session_id.clone(), view);
+
+                for nested_session_id in nested_session_ids {
+                    this.load_subagent_session(
+                        nested_session_id,
+                        subagent_session_id.clone(),
+                        window,
+                        cx,
+                    );
+                }
             })
         })
         .detach();

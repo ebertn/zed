@@ -48,11 +48,13 @@ Base: `origin/main`
     replay path alone can't — `open_thread` drains replay before the view
     subscribes, so the `SubagentSpawned` event is missed). The spawn tool's
     `replay` also re-emits `subagent_spawned` for the live path.
-  - Restored subagents are marked delivered so they never trigger a spurious
-    auto-pull "[Automatic update]" after a restart.
-  - [ ] Follow-up: nested subagents (a subagent's own subagents) aren't recursively
-    reloaded; messaging/resuming a restored subagent across sessions still depends
-    on its session being loaded (now true for direct subagents of the root thread).
+  - Restored subagents are marked delivered (legacy field retained for DB
+    compatibility; auto-pull-when-idle has since been removed entirely).
+  - **Nested subagents are recursively reloaded.** `load_subagent_session` scans
+    each reopened subagent thread for its own `subagent_session_info` tool calls
+    and reloads those too, so cards are restored at every level of the tree
+    (`ConversationView::subagent_session_ids` is the shared scan helper used by
+    both `initial_state` and `load_subagent_session`).
 - [x] **Phase 4 (edit-safety — WriteCoordinator)**: concurrent edits across all
   agents (primary + background subagents) are now serialized per buffer. A
   `WriteCoordinator` app-global maps each buffer's `EntityId` to an
@@ -495,8 +497,9 @@ are owned by the current turn. Background subagents outlive the turn, so:
   the entry visible for inspection, and drop the driver task. Decide retention
   (keep until parent thread closes? until user dismisses?).
 - Closing/deleting the parent thread cancels all its background subagents.
-- Respect `MAX_SUBAGENT_DEPTH`; background subagents spawning their own subagents
-  inherit the same depth rules.
+- Respect `MAX_SUBAGENT_DEPTH` (currently 3 — three levels of subagents beneath
+  the root); background subagents spawning their own subagents inherit the same
+  depth rules. Threads at depth `< MAX_SUBAGENT_DEPTH` get the spawning tools.
 
 ---
 
