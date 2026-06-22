@@ -366,6 +366,11 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
         decl.add_method(
+            sel!(makeFirstResponder:),
+            make_first_responder as extern "C" fn(&Object, Sel, id) -> BOOL,
+        );
+
+        decl.add_method(
             sel!(canBecomeMainWindow),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
         );
@@ -2259,6 +2264,46 @@ extern "C" fn hit_test(this: &Object, _: Sel, location: NSPoint) -> id {
         nil
     } else {
         unsafe { msg_send![super(this, class!(NSView)), hitTest: location] }
+    }
+}
+
+/// Refuses to make an embedded WKWebView (or any of its descendant views) the
+/// window's first responder, so keyboard focus stays with GPUI even when WebKit
+/// tries to focus its web content on load. The canvas WebView is a display
+/// surface: it still receives mouse events (scroll, text selection) through the
+/// `hitTest:` passthrough, but typing always goes to Zed rather than the page.
+/// All other responders fall back to the default NSWindow behavior; GPUI's own
+/// views never descend from a WKWebView, so they are unaffected.
+extern "C" fn make_first_responder(this: &Object, _: Sel, responder: id) -> BOOL {
+    unsafe {
+        if !responder.is_null() && responder_within_webview(responder) {
+            return NO;
+        }
+        msg_send![super(this, class!(NSWindow)), makeFirstResponder: responder]
+    }
+}
+
+/// Whether `responder` is, or is a descendant view of, a WKWebView. Safe for any
+/// NSResponder: non-NSView responders and views without a WebView ancestor
+/// return false.
+unsafe fn responder_within_webview(responder: id) -> bool {
+    unsafe {
+        let Some(webview_class) = Class::get("WKWebView") else {
+            return false;
+        };
+        let is_view: BOOL = msg_send![responder, isKindOfClass: class!(NSView)];
+        if is_view == NO {
+            return false;
+        }
+        let mut view = responder;
+        while !view.is_null() {
+            let is_webview: BOOL = msg_send![view, isKindOfClass: webview_class];
+            if is_webview == YES {
+                return true;
+            }
+            view = msg_send![view, superview];
+        }
+        false
     }
 }
 
