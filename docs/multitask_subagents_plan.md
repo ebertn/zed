@@ -497,9 +497,11 @@ are owned by the current turn. Background subagents outlive the turn, so:
   the entry visible for inspection, and drop the driver task. Decide retention
   (keep until parent thread closes? until user dismisses?).
 - Closing/deleting the parent thread cancels all its background subagents.
-- Respect `MAX_SUBAGENT_DEPTH` (currently 3 — three levels of subagents beneath
-  the root); background subagents spawning their own subagents inherit the same
+- Respect `MAX_SUBAGENT_DEPTH` (currently 1 — only the root agent can spawn
+  subagents); background subagents spawning their own subagents inherit the same
   depth rules. Threads at depth `< MAX_SUBAGENT_DEPTH` get the spawning tools.
+  (Nested-card reload below already handles deeper nesting if the constant is
+  raised.)
 
 ---
 
