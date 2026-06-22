@@ -133,6 +133,21 @@ fn register_canvas(view: &Entity<CanvasView>, window: AnyWindowHandle, cx: &mut 
     // WebView behind the transparency hole). Defer so the refresh runs once the
     // window borrow has been released and the handle resolves again.
     cx.defer(move |cx| refresh_window_transparency(window, cx));
+
+    // The deferred refresh above runs in the same event-loop turn the WebView is
+    // attached. On a cold first open that initial application doesn't reliably
+    // make the window composite as non-opaque (closing and reopening the tab
+    // forced it). Re-apply once more after the attach + first paint have settled,
+    // which goes through `window.refresh()` again; this makes the first open
+    // render without the manual close/reopen.
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_millis(200))
+            .await;
+        // Best-effort: if the window or app is gone by now, there's nothing to do.
+        let _ = cx.update(|cx| refresh_window_transparency(window, cx));
+    })
+    .detach();
     id
 }
 

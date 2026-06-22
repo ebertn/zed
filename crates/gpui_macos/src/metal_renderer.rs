@@ -446,6 +446,23 @@ impl MetalRenderer {
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
+            // Flipping `opaque` doesn't affect drawables that were already
+            // allocated: a CAMetalLayer's drawables are IOSurface-backed, and a
+            // surface created while the layer was opaque keeps compositing
+            // opaquely until it is recreated. That only happens on a resize
+            // (`setDrawableSize:`), which is why a freshly-transparent window's
+            // hole read black until the view was resized (e.g. closing and
+            // reopening the tab). Nudge the drawable size and restore it to force
+            // the layer to discard and regenerate its drawables now.
+            let size = layer.drawable_size();
+            let nudged = NSSize {
+                width: size.width,
+                height: size.height + 1.0,
+            };
+            unsafe {
+                let _: () = msg_send![layer.as_ref(), setDrawableSize: nudged];
+                let _: () = msg_send![layer.as_ref(), setDrawableSize: size];
+            }
         }
     }
 
