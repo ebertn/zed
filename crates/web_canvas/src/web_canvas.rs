@@ -35,6 +35,8 @@ use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimpl
 
 #[cfg(target_os = "macos")]
 use std::{cell::RefCell, rc::Rc};
+#[cfg(target_os = "macos")]
+use futures::{StreamExt as _, channel::mpsc};
 
 pub fn init(cx: &mut App) {
     surface::register_surface_provider(cx, Arc::new(CanvasProvider));
@@ -377,6 +379,19 @@ fn live_canvas_id_for_path(path: &Path, cx: &App) -> Option<u64> {
     })
 }
 
+/// The live (open) canvas authored under `title`, if any. Resolves the title to
+/// its canonical file path (the same slug used everywhere) and matches an open
+/// canvas showing that file, so the agent-facing tools can identify a canvas by
+/// its human title rather than the internal numeric id.
+fn live_canvas_for_title(title: &str, cx: &App) -> Option<Entity<CanvasView>> {
+    let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(title)));
+    let registry = cx.try_global::<CanvasRegistry>()?;
+    registry
+        .instances
+        .values()
+        .find_map(|weak| weak.upgrade().filter(|view| view.read(cx).path == path))
+}
+
 /// Opens a canvas, or focuses the existing tab if one is already showing `path`
 /// (so opening the same canvas twice doesn't create duplicate tabs).
 fn open_or_focus_canvas(title: &str, path: &Path, cx: &mut App) -> Result<SurfaceId> {
@@ -604,18 +619,18 @@ impl AgentTool for CanvasOpenTool {
                 );
             });
             Ok(format!(
-                "Opened canvas \"{}\" (id {}). It is the file `{}` — author it by editing that file directly with `edit_file` (it hot-reloads on save). Lint your edits with `diagnostics`, then call `canvas_errors` with id {} to confirm it renders without errors.",
+                "Opened canvas \"{}\" (the file `{}`). Call `canvas_errors` with title \"{}\" to confirm it rendered without errors; fix any by editing the file with `edit_file` (it hot-reloads).",
                 input.title,
-                id.0,
                 path.display(),
-                id.0
+                input.title
             ))
         })
     }
 }
 
-/// Lists the open canvases as JSON `[{ "id", "title" }]` so the agent can decide
-/// which one to focus.
+/// Lists the currently open canvases as JSON `[{ "title" }]` so the agent can
+/// see which canvases are open and identify them by title (the same title used
+/// by `create_canvas`, `canvas_open`, and `canvas_errors`).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasListToolInput {}
 
@@ -650,7 +665,7 @@ impl AgentTool for CanvasListTool {
             let canvases = cx.update(|cx| live_canvases(cx));
             let json = canvases
                 .into_iter()
-                .map(|(id, title)| serde_json::json!({ "id": id, "title": title.to_string() }))
+                .map(|(_id, title)| serde_json::json!({ "title": title.to_string() }))
                 .collect::<Vec<_>>();
             serde_json::to_string(&json).map_err(|err| err.to_string())
         })
@@ -658,12 +673,14 @@ impl AgentTool for CanvasListTool {
 }
 
 /// Reports JavaScript/render errors for a canvas, so you can verify a canvas you
-/// created or edited actually renders. Call this after `canvas_open` or after
-/// editing a `.canvas.tsx` file to check for problems and fix them.
+/// created or edited actually renders. Call this (by the canvas's `title`) after
+/// `canvas_open`, or after editing a `.canvas.tsx` file, to check for problems
+/// and fix them.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasErrorsToolInput {
-    /// The id of the canvas to check (from `canvas_open` or `canvas_list`).
-    id: u64,
+    /// The title of the canvas to check — the same title passed to
+    /// `create_canvas` / `canvas_open`. The canvas must be open.
+    title: String,
 }
 
 struct CanvasErrorsTool;
@@ -684,7 +701,7 @@ impl AgentTool for CanvasErrorsTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => format!("Check canvas {} for errors", input.id).into(),
+            Ok(input) => format!("Check canvas \"{}\" for errors", input.title).into(),
             Err(_) => "Check canvas for errors".into(),
         }
     }
@@ -697,6 +714,7 @@ impl AgentTool for CanvasErrorsTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|err| err.to_string())?;
+            let title = input.title;
             // Give a pending hot-reload (the file watcher polls ~600ms) time to
             // re-render and report its error state before we read it.
             cx.background_executor()
@@ -704,15 +722,16 @@ impl AgentTool for CanvasErrorsTool {
                 .await;
             let errors = cx
                 .update(|cx| {
-                    canvas_by_id(input.id, cx).map(|view| view.read(cx).render_errors())
+                    live_canvas_for_title(&title, cx).map(|view| view.read(cx).render_errors())
                 })
-                .ok_or_else(|| format!("no open canvas with id {}", input.id))?;
+                .ok_or_else(|| {
+                    format!("canvas \"{title}\" is not open - open it with `canvas_open` first")
+                })?;
             if errors.is_empty() {
-                Ok(format!("Canvas {} rendered with no errors.", input.id))
+                Ok(format!("Canvas \"{title}\" rendered with no errors."))
             } else {
                 Ok(format!(
-                    "Canvas {} reported {} error(s):\n{}",
-                    input.id,
+                    "Canvas \"{title}\" reported {} error(s):\n{}",
                     errors.len(),
                     errors.join("\n")
                 ))
@@ -766,6 +785,10 @@ struct CanvasView {
     // rendered cleanly). Read by the `canvas_errors` tool.
     #[cfg(target_os = "macos")]
     errors: Rc<RefCell<Vec<String>>>,
+    // Redraws the view whenever the page reports a render, so the transparency
+    // hole recomposites over the freshly-painted WebView. Cancelled when dropped.
+    #[cfg(target_os = "macos")]
+    _render_task: Task<()>,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -792,7 +815,30 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         let errors = Rc::new(RefCell::new(Vec::new()));
         #[cfg(target_os = "macos")]
-        let webview = attach_webview(window, document.clone(), errors.clone()).map(Rc::new);
+        let (render_tx, mut render_rx) = mpsc::unbounded::<()>();
+        #[cfg(target_os = "macos")]
+        let webview =
+            attach_webview(window, document.clone(), errors.clone(), render_tx).map(Rc::new);
+        // Redraw the view on every page-render signal. The first signal arrives
+        // once the WebView has actually painted, which recomposites the
+        // transparency hole over real content instead of a black, unpainted view.
+        // On that first paint we also re-apply the window transparency: the
+        // initial application (in the same turn the WebView is attached) doesn't
+        // make a cold window composite as non-opaque, but re-applying once real
+        // content exists does. Tying it to the paint signal avoids a fixed
+        // "settle" delay.
+        #[cfg(target_os = "macos")]
+        let render_task = cx.spawn(async move |this, cx| {
+            let mut first_paint = true;
+            while render_rx.next().await.is_some() {
+                if this.update(cx, |_this, cx| cx.notify()).is_err() {
+                    break;
+                }
+                if std::mem::take(&mut first_paint) {
+                    cx.update(|cx| refresh_window_transparency(window_handle, cx));
+                }
+            }
+        });
         #[cfg(target_os = "macos")]
         let theme_subscription =
             cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
@@ -816,6 +862,8 @@ impl CanvasView {
             _theme_subscription: theme_subscription,
             #[cfg(target_os = "macos")]
             errors,
+            #[cfg(target_os = "macos")]
+            _render_task: render_task,
             _watch_task: watch_task,
         }
     }
@@ -1199,6 +1247,7 @@ fn attach_webview(
     window: &Window,
     document: Rc<RefCell<String>>,
     errors: Rc<RefCell<Vec<String>>>,
+    render_signal: mpsc::UnboundedSender<()>,
 ) -> Option<wry::WebView> {
     use std::borrow::Cow;
     use wry::WebViewBuilder;
@@ -1243,7 +1292,10 @@ fn attach_webview(
     };
 
     // The page reports its render error state over IPC after each (re)render; we
-    // store it so the `canvas_errors` tool can report it back to the agent.
+    // store it so the `canvas_errors` tool can report it back to the agent, and
+    // signal the view so it recomposites the transparency hole now that the
+    // WebView has painted (otherwise the first frame after open can show through
+    // to an unpainted, black WebView until something else forces a redraw).
     let ipc_errors = errors;
     let ipc_handler = move |request: wry::http::Request<String>| {
         let body = request.body();
@@ -1251,6 +1303,9 @@ fn attach_webview(
             Ok(report) => *ipc_errors.borrow_mut() = report.errors,
             Err(err) => log::error!("canvas: bad IPC error report: {err}"),
         }
+        // Failure means the receiving view was dropped (canvas closed); nothing
+        // left to redraw, so ignoring it is correct.
+        render_signal.unbounded_send(()).ok();
     };
 
     match WebViewBuilder::new_as_child(&parent)
@@ -1660,8 +1715,16 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
     } catch (e) {
       fail('run: ' + String((e && e.stack) || e));
     }
-    // Report the post-render error state (empty list means success).
-    window.__reportCanvasErrors();
+    // Report after the browser has actually painted. `createRoot().render()` is
+    // asynchronous, so reporting synchronously here fires before the WebView has
+    // any pixels; the host would then redraw the transparency hole over an empty
+    // (black) view and never redraw again. A double rAF waits until after the
+    // first paint so the host's redraw composites over real content.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        window.__reportCanvasErrors();
+      });
+    });
   })();
 </script>
 
