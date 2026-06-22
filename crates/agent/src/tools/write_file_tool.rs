@@ -23,7 +23,7 @@ const DEFAULT_UI_TEXT: &str = "Writing file";
 ///
 /// Before using this tool, verify the directory path is correct (only applicable when creating new files). Use the `list_directory` tool to verify the parent directory exists and is the correct location
 ///
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// The only supported paths outside the project are descendants of `~/.agents` (e.g. global agent skills under `~/.agents/skills`, or canvases under `~/.agents/canvases`).
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileToolInput {
     /// The full path of the file to create or overwrite in the project.

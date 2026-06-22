@@ -22,7 +22,7 @@ use std::path::Path;
 /// Creates a new directory at the specified path within the project. Returns confirmation that the directory was created.
 ///
 /// This tool creates a directory and all necessary parent directories. It should be used whenever you need to create new directories within the project.
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// The only supported paths outside the project are descendants of `~/.agents` (e.g. global agent skills under `~/.agents/skills`, or canvases under `~/.agents/canvases`).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateDirectoryToolInput {
     /// The path of the new directory.
@@ -275,10 +275,10 @@ mod tests {
         cx.executor().run_until_parked();
 
         let tool = Arc::new(CreateDirectoryTool::new(project));
-        let outside_path = agent_skills::global_skills_dir()
+        let outside_path = agent_skills::global_agents_dir()
             .parent()
-            .expect("global skills directory should have a parent")
-            .join("not-skills");
+            .expect("global agents directory should have a parent")
+            .join("not-agents");
 
         let (event_stream, mut event_rx) = ToolCallEventStream::test();
         let result = cx
@@ -295,7 +295,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "Tool should reject paths outside the project and global skills directory"
+            "Tool should reject paths outside the project and the ~/.agents directory"
         );
         assert!(!fs.is_dir(&outside_path).await);
         assert!(

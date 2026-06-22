@@ -1194,6 +1194,9 @@
           "spawn_agent": true,
           "terminal": true,
           "search_web": true,
+          "canvas_open": true,
+          "canvas_list": true,
+          "canvas_errors": true,
         },
       },
       "ask": {
@@ -1215,6 +1218,9 @@
           "skill": true,
           "spawn_agent": true,
           "search_web": true,
+          "canvas_open": true,
+          "canvas_list": true,
+          "canvas_errors": true,
         },
       },
       "minimal": {

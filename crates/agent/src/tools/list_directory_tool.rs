@@ -19,7 +19,7 @@ use util::markdown::MarkdownInlineCode;
 
 /// Lists files and directories in a given path. Prefer the `grep` or `find_path` tools when searching the codebase.
 ///
-/// The only supported path outside the project is `~/.agents/skills` or a descendant, for global agent skills.
+/// The only supported paths outside the project are descendants of `~/.agents` (e.g. global agent skills under `~/.agents/skills`, or canvases under `~/.agents/canvases`).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListDirectoryToolInput {
     /// The fully-qualified path of the directory to list in the project.

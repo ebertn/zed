@@ -101,6 +101,15 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
                               [[buffer(QuadInputIndex_Quads)]]) {
   Quad quad = quads[input.quad_id];
+
+  // Transparency hole (tag 4): clear the surface to fully transparent over the
+  // quad's bounds. The hole pipeline disables blending so this output replaces
+  // the destination pixel, punching alpha to 0 so a native view behind the
+  // surface shows through.
+  if (quad.background.tag == 4) {
+    return float4(0.0);
+  }
+
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 

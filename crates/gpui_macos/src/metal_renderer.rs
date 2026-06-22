@@ -121,6 +121,7 @@ pub(crate) struct MetalRenderer {
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    quads_hole_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -290,6 +291,14 @@ impl MetalRenderer {
             "quad_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let quads_hole_pipeline_state = build_quad_hole_pipeline_state(
+            &device,
+            &library,
+            "quads_hole",
+            "quad_vertex",
+            "quad_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let underlines_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -340,6 +349,7 @@ impl MetalRenderer {
             path_sprites_pipeline_state,
             shadows_pipeline_state,
             quads_pipeline_state,
+            quads_hole_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -1118,9 +1128,59 @@ impl MetalRenderer {
         if quads.is_empty() {
             return true;
         }
+
+        // Most quads use the standard additive-blend pipeline, but transparency
+        // holes need the blend-disabled pipeline so their `(0,0,0,0)` output
+        // clears the surface. Draw the slice as maximal runs of a single kind,
+        // switching pipeline per run. Each run is copied at its own aligned
+        // offset so the shader's per-instance indexing stays zero-based.
+        let mut run_start = 0;
+        while run_start < quads.len() {
+            let is_hole = quads[run_start].background.is_transparency_hole();
+            let mut run_end = run_start + 1;
+            while run_end < quads.len()
+                && quads[run_end].background.is_transparency_hole() == is_hole
+            {
+                run_end += 1;
+            }
+
+            let pipeline_state = if is_hole {
+                &self.quads_hole_pipeline_state
+            } else {
+                &self.quads_pipeline_state
+            };
+            if !self.draw_quad_run(
+                &quads[run_start..run_end],
+                pipeline_state,
+                instance_buffer,
+                instance_offset,
+                viewport_size,
+                command_encoder,
+            ) {
+                return false;
+            }
+
+            run_start = run_end;
+        }
+
+        true
+    }
+
+    fn draw_quad_run(
+        &self,
+        quads: &[Quad],
+        pipeline_state: &metal::RenderPipelineStateRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if quads.is_empty() {
+            return true;
+        }
         align_offset(instance_offset);
 
-        command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_render_pipeline_state(pipeline_state);
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1622,6 +1682,40 @@ fn build_pipeline_state(
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// Builds a quad pipeline with blending disabled, so the fragment output
+/// replaces the destination pixel. Used for transparency-hole quads, whose
+/// fragment writes `(0, 0, 0, 0)` to clear the surface to fully transparent.
+/// The standard quad pipeline's alpha blend is additive and so can only ever
+/// increase destination alpha, which cannot punch a hole through the opaque
+/// backgrounds already painted behind it.
+fn build_quad_hole_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
 
     device
         .new_render_pipeline_state(&descriptor)
