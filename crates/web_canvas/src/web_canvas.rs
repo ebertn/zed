@@ -377,6 +377,19 @@ fn live_canvas_id_for_path(path: &Path, cx: &App) -> Option<u64> {
     })
 }
 
+/// The live (open) canvas authored under `title`, if any. Resolves the title to
+/// its canonical file path (the same slug used everywhere) and matches an open
+/// canvas showing that file, so the agent-facing tools can identify a canvas by
+/// its human title rather than the internal numeric id.
+fn live_canvas_for_title(title: &str, cx: &App) -> Option<Entity<CanvasView>> {
+    let path = canvases_dir().join(format!("{}.canvas.tsx", slugify(title)));
+    let registry = cx.try_global::<CanvasRegistry>()?;
+    registry
+        .instances
+        .values()
+        .find_map(|weak| weak.upgrade().filter(|view| view.read(cx).path == path))
+}
+
 /// Opens a canvas, or focuses the existing tab if one is already showing `path`
 /// (so opening the same canvas twice doesn't create duplicate tabs).
 fn open_or_focus_canvas(title: &str, path: &Path, cx: &mut App) -> Result<SurfaceId> {
@@ -604,18 +617,18 @@ impl AgentTool for CanvasOpenTool {
                 );
             });
             Ok(format!(
-                "Opened canvas \"{}\" (id {}). It is the file `{}` — author it by editing that file directly with `edit_file` (it hot-reloads on save). Lint your edits with `diagnostics`, then call `canvas_errors` with id {} to confirm it renders without errors.",
+                "Opened canvas \"{}\" (the file `{}`). Call `canvas_errors` with title \"{}\" to confirm it rendered without errors; fix any by editing the file with `edit_file` (it hot-reloads).",
                 input.title,
-                id.0,
                 path.display(),
-                id.0
+                input.title
             ))
         })
     }
 }
 
-/// Lists the open canvases as JSON `[{ "id", "title" }]` so the agent can decide
-/// which one to focus.
+/// Lists the currently open canvases as JSON `[{ "title" }]` so the agent can
+/// see which canvases are open and identify them by title (the same title used
+/// by `create_canvas`, `canvas_open`, and `canvas_errors`).
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasListToolInput {}
 
@@ -650,7 +663,7 @@ impl AgentTool for CanvasListTool {
             let canvases = cx.update(|cx| live_canvases(cx));
             let json = canvases
                 .into_iter()
-                .map(|(id, title)| serde_json::json!({ "id": id, "title": title.to_string() }))
+                .map(|(_id, title)| serde_json::json!({ "title": title.to_string() }))
                 .collect::<Vec<_>>();
             serde_json::to_string(&json).map_err(|err| err.to_string())
         })
@@ -658,12 +671,14 @@ impl AgentTool for CanvasListTool {
 }
 
 /// Reports JavaScript/render errors for a canvas, so you can verify a canvas you
-/// created or edited actually renders. Call this after `canvas_open` or after
-/// editing a `.canvas.tsx` file to check for problems and fix them.
+/// created or edited actually renders. Call this (by the canvas's `title`) after
+/// `canvas_open`, or after editing a `.canvas.tsx` file, to check for problems
+/// and fix them.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CanvasErrorsToolInput {
-    /// The id of the canvas to check (from `canvas_open` or `canvas_list`).
-    id: u64,
+    /// The title of the canvas to check — the same title passed to
+    /// `create_canvas` / `canvas_open`. The canvas must be open.
+    title: String,
 }
 
 struct CanvasErrorsTool;
@@ -684,7 +699,7 @@ impl AgentTool for CanvasErrorsTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => format!("Check canvas {} for errors", input.id).into(),
+            Ok(input) => format!("Check canvas \"{}\" for errors", input.title).into(),
             Err(_) => "Check canvas for errors".into(),
         }
     }
@@ -697,6 +712,7 @@ impl AgentTool for CanvasErrorsTool {
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|err| err.to_string())?;
+            let title = input.title;
             // Give a pending hot-reload (the file watcher polls ~600ms) time to
             // re-render and report its error state before we read it.
             cx.background_executor()
@@ -704,15 +720,16 @@ impl AgentTool for CanvasErrorsTool {
                 .await;
             let errors = cx
                 .update(|cx| {
-                    canvas_by_id(input.id, cx).map(|view| view.read(cx).render_errors())
+                    live_canvas_for_title(&title, cx).map(|view| view.read(cx).render_errors())
                 })
-                .ok_or_else(|| format!("no open canvas with id {}", input.id))?;
+                .ok_or_else(|| {
+                    format!("canvas \"{title}\" is not open - open it with `canvas_open` first")
+                })?;
             if errors.is_empty() {
-                Ok(format!("Canvas {} rendered with no errors.", input.id))
+                Ok(format!("Canvas \"{title}\" rendered with no errors."))
             } else {
                 Ok(format!(
-                    "Canvas {} reported {} error(s):\n{}",
-                    input.id,
+                    "Canvas \"{title}\" reported {} error(s):\n{}",
                     errors.len(),
                     errors.join("\n")
                 ))
