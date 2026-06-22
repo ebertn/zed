@@ -48,6 +48,7 @@ actions!(
 
 pub fn init(cx: &mut App) {
     surface::register_surface_provider(cx, Arc::new(CanvasProvider));
+    surface::load_persisted(cx);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &OpenCanvasSpike, window, cx| {
@@ -88,7 +89,9 @@ pub fn init(cx: &mut App) {
     // model if the active agent profile lists it (`agent.profiles.*.tools` in
     // settings) — these three are enabled in the default `write`/`ask` profiles.
     cx.observe_new(|thread: &mut Thread, _window, _cx| {
-        thread.add_tool(CanvasOpenTool);
+        thread.add_tool(CanvasOpenTool {
+            session_id: thread.id().clone(),
+        });
         thread.add_tool(CanvasUpdateTool);
         thread.add_tool(CanvasListTool);
         thread.add_tool(CanvasFocusTool);
@@ -264,6 +267,23 @@ impl SurfaceProvider for CanvasProvider {
             .map_err(|err| anyhow!("failed to write {}: {err}", path.display()))?;
         view.update(cx, |view, cx| view.set_content(&content, cx));
         Ok(())
+    }
+
+    fn focus(
+        &self,
+        id: SurfaceId,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Result<bool> {
+        let Some(view) = canvas_by_id(id.0, cx) else {
+            return Ok(false);
+        };
+        let activated = workspace.activate_item(&view, true, true, window, cx);
+        if activated && let Some(registry) = try_global_mut::<CanvasRegistry>(cx) {
+            registry.last_focused = Some(id.0);
+        }
+        Ok(activated)
     }
 }
 
@@ -460,7 +480,11 @@ struct CanvasOpenToolInput {
     content: String,
 }
 
-struct CanvasOpenTool;
+struct CanvasOpenTool {
+    /// The session that owns this tool instance, recorded so the created canvas
+    /// can be associated with (and reopened from) the conversation.
+    session_id: acp::SessionId,
+}
 
 impl AgentTool for CanvasOpenTool {
     type Input = CanvasOpenToolInput;
@@ -489,6 +513,7 @@ impl AgentTool for CanvasOpenTool {
         _event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
+        let session_id = self.session_id.clone();
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|err| err.to_string())?;
             let path =
@@ -496,9 +521,25 @@ impl AgentTool for CanvasOpenTool {
             // Make the canvases dir a (non-visible) worktree so `edit_file` and the
             // language server work on the file before the agent edits it.
             ensure_canvas_worktree(cx).await.map_err(|err| err.to_string())?;
+            let path_string = path.to_string_lossy().to_string();
             let id = cx
                 .update(|cx| open_canvas_surface(&input.title, &path, cx))
                 .map_err(|err| err.to_string())?;
+            // Associate the canvas with this conversation so the thread view can
+            // offer to (re)open it. `params` mirror what `CanvasProvider::open`
+            // expects, so a closed canvas can be reopened from disk.
+            let title = input.title.clone();
+            cx.update(|cx| {
+                let params = serde_json::json!({ "title": &title, "path": &path_string });
+                surface::record_session_surface(
+                    surface::SessionKey::new(session_id.0.to_string()),
+                    "canvas",
+                    title,
+                    params,
+                    id,
+                    cx,
+                );
+            });
             Ok(format!(
                 "Opened canvas \"{}\" (id {}). It is the file `{}` — edit that file directly with your normal file tools to iterate (it hot-reloads on save).",
                 input.title,

@@ -532,6 +532,7 @@ dependencies = [
  "serde_json_lenient",
  "settings",
  "streaming_diff",
+ "surface",
  "task",
  "telemetry",
  "tempfile",
@@ -18325,6 +18326,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "log",
+ "paths",
+ "serde",
  "serde_json",
  "workspace",
 ]

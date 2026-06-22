@@ -2823,6 +2823,16 @@ impl ThreadView {
         let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
+        // Canvases created by this conversation (main session only, mirroring how
+        // edits are only shown on the parent thread).
+        let canvases = if thread.parent_session_id().is_none() {
+            surface::session_surfaces(
+                &surface::SessionKey::new(thread.session_id().0.to_string()),
+                cx,
+            )
+        } else {
+            Vec::new()
+        };
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
@@ -2832,6 +2842,7 @@ impl ThreadView {
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
+            && canvases.is_empty()
             && !has_awaiting_permission
         {
             return None;
@@ -2911,10 +2922,22 @@ impl ThreadView {
                             })
                         },
                     )
+                    .when(!canvases.is_empty(), |this| {
+                        this.when(
+                            has_awaiting_permission
+                                || !plan.is_empty()
+                                || !changed_buffers.is_empty(),
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
+                        .child(self.render_canvases_summary(&canvases, cx))
+                    })
                     .when(!queue_is_empty, |this| {
-                        this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
-                            this.child(Divider::horizontal().color(DividerColor::Border))
-                        })
+                        this.when(
+                            !plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || !canvases.is_empty(),
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
                         .child(self.render_message_queue_summary(window, cx))
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
@@ -2923,6 +2946,77 @@ impl ThreadView {
             )
             .into_any()
             .into()
+    }
+
+    /// A summary row for canvases this conversation created, each opening (or
+    /// reopening from disk) the canvas on click. See the `surface` crate.
+    fn render_canvases_summary(
+        &self,
+        canvases: &[surface::SurfaceInfo],
+        cx: &Context<Self>,
+    ) -> Div {
+        let session_key =
+            surface::SessionKey::new(self.thread.read(cx).session_id().0.to_string());
+
+        v_flex()
+            .p_1()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .px_1()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::Image)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("Canvas").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new("•")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Disabled),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{} {}",
+                            canvases.len(),
+                            if canvases.len() == 1 {
+                                "canvas"
+                            } else {
+                                "canvases"
+                            }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .children(canvases.iter().map(|canvas| {
+                let index = canvas.index;
+                let session_key = session_key.clone();
+                Button::new(
+                    SharedString::from(format!("open-canvas-{index}")),
+                    canvas.title.clone(),
+                )
+                .start_icon(
+                    Icon::new(IconName::Maximize)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .label_size(LabelSize::Small)
+                .full_width()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let session_key = session_key.clone();
+                    let workspace = this.workspace.clone();
+                    let result = workspace.update(cx, |workspace, cx| {
+                        surface::focus_surface(&session_key, index, workspace, window, cx)
+                    });
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => log::error!("canvas: failed to open: {err}"),
+                        Err(err) => log::error!("canvas: workspace unavailable: {err}"),
+                    }
+                }))
+            }))
     }
 
     fn render_edited_files(

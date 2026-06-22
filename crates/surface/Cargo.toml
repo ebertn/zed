@@ -10,6 +10,9 @@ path = "src/surface.rs"
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
+log.workspace = true
+paths.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 workspace.workspace = true
 
