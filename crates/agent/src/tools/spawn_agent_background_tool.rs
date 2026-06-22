@@ -31,9 +31,12 @@ use settings::Settings as _;
 ///
 /// ### Getting results back
 /// - This tool does NOT return the sub-agent's answer. It returns a `session_id`.
-/// - Use `list_subagents` to monitor progress, and a collect/await step to retrieve
-///   the final output. Completed background sub-agents are also surfaced back to you
-///   automatically when you are otherwise idle.
+/// - Results are NOT delivered to you automatically. To act on a sub-agent's
+///   work you must explicitly check on it: use `list_subagents` to monitor
+///   progress and read completed output, or `await_subagent` to block until a
+///   specific sub-agent finishes and return its result.
+/// - Staying responsive to the user does not require collecting results
+///   immediately: you can spawn, keep talking to the user, and collect later.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentBackgroundToolInput {
