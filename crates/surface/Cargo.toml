@@ -1,0 +1,17 @@
+[package]
+name = "surface"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/surface.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+serde_json.workspace = true
+workspace.workspace = true
+
+[lints]
+workspace = true
