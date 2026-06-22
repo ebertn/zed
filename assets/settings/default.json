@@ -1176,6 +1176,7 @@
           "canvas_update": true,
           "canvas_list": true,
           "canvas_focus": true,
+          "canvas_errors": true,
         },
       },
       "ask": {
@@ -1201,6 +1202,7 @@
           "canvas_update": true,
           "canvas_list": true,
           "canvas_focus": true,
+          "canvas_errors": true,
         },
       },
       "minimal": {

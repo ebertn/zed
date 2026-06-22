@@ -95,6 +95,7 @@ pub fn init(cx: &mut App) {
         thread.add_tool(CanvasUpdateTool);
         thread.add_tool(CanvasListTool);
         thread.add_tool(CanvasFocusTool);
+        thread.add_tool(CanvasErrorsTool);
     })
     .detach();
 }
@@ -224,6 +225,13 @@ struct CanvasParams {
     title: Option<String>,
     path: Option<String>,
     content: Option<String>,
+}
+
+/// The IPC payload the canvas page posts after each render, listing any errors
+/// captured during transpile/render (empty means it rendered cleanly).
+#[derive(Deserialize)]
+struct CanvasErrorReport {
+    errors: Vec<String>,
 }
 
 impl SurfaceProvider for CanvasProvider {
@@ -541,10 +549,11 @@ impl AgentTool for CanvasOpenTool {
                 );
             });
             Ok(format!(
-                "Opened canvas \"{}\" (id {}). It is the file `{}` — edit that file directly with your normal file tools to iterate (it hot-reloads on save).",
+                "Opened canvas \"{}\" (id {}). It is the file `{}` — edit that file directly with your normal file tools to iterate (it hot-reloads on save). After creating or editing it, call `canvas_errors` with id {} to verify it renders without errors.",
                 input.title,
                 id.0,
-                path.display()
+                path.display(),
+                id.0
             ))
         })
     }
@@ -693,6 +702,70 @@ impl AgentTool for CanvasFocusTool {
     }
 }
 
+/// Reports JavaScript/render errors for a canvas, so you can verify a canvas you
+/// created or edited actually renders. Call this after `canvas_open` or after
+/// editing a `.canvas.tsx` file to check for problems and fix them.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct CanvasErrorsToolInput {
+    /// The id of the canvas to check (from `canvas_open` or `canvas_list`).
+    id: u64,
+}
+
+struct CanvasErrorsTool;
+
+impl AgentTool for CanvasErrorsTool {
+    type Input = CanvasErrorsToolInput;
+    type Output = String;
+
+    const NAME: &'static str = "canvas_errors";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Other
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        match input {
+            Ok(input) => format!("Check canvas {} for errors", input.id).into(),
+            Err(_) => "Check canvas for errors".into(),
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(|err| err.to_string())?;
+            // Give a pending hot-reload (the file watcher polls ~600ms) time to
+            // re-render and report its error state before we read it.
+            cx.background_executor()
+                .timer(Duration::from_millis(900))
+                .await;
+            let errors = cx
+                .update(|cx| {
+                    canvas_by_id(input.id, cx).map(|view| view.read(cx).render_errors())
+                })
+                .ok_or_else(|| format!("no open canvas with id {}", input.id))?;
+            if errors.is_empty() {
+                Ok(format!("Canvas {} rendered with no errors.", input.id))
+            } else {
+                Ok(format!(
+                    "Canvas {} reported {} error(s):\n{}",
+                    input.id,
+                    errors.len(),
+                    errors.join("\n")
+                ))
+            }
+        })
+    }
+}
+
 // --- The canvas view (a workspace Item) --------------------------------------
 
 /// What the canvas tab is currently showing.
@@ -734,6 +807,10 @@ struct CanvasView {
     // Rebuilds the document when the host theme changes; dropped with the view.
     #[cfg(target_os = "macos")]
     _theme_subscription: Subscription,
+    // The latest render error list reported by the page over IPC (empty means it
+    // rendered cleanly). Read by the `canvas_errors` tool.
+    #[cfg(target_os = "macos")]
+    errors: Rc<RefCell<Vec<String>>>,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -758,7 +835,9 @@ impl CanvasView {
             &theme_json,
         )));
         #[cfg(target_os = "macos")]
-        let webview = attach_webview(window, document.clone()).map(Rc::new);
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        #[cfg(target_os = "macos")]
+        let webview = attach_webview(window, document.clone(), errors.clone()).map(Rc::new);
         #[cfg(target_os = "macos")]
         let theme_subscription =
             cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
@@ -780,6 +859,8 @@ impl CanvasView {
             theme_json,
             #[cfg(target_os = "macos")]
             _theme_subscription: theme_subscription,
+            #[cfg(target_os = "macos")]
+            errors,
             _watch_task: watch_task,
         }
     }
@@ -825,6 +906,19 @@ impl CanvasView {
             {
                 log::error!("canvas: load_url failed: {err}");
             }
+        }
+    }
+
+    /// The latest render errors reported by the page (empty means it rendered
+    /// cleanly). Always empty off macOS, where there is no WebView.
+    fn render_errors(&self) -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.errors.borrow().clone()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
         }
     }
 
@@ -1084,7 +1178,11 @@ fn position_webview(webview: Option<&Rc<wry::WebView>>, bounds: Bounds<Pixels>) 
 }
 
 #[cfg(target_os = "macos")]
-fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry::WebView> {
+fn attach_webview(
+    window: &Window,
+    document: Rc<RefCell<String>>,
+    errors: Rc<RefCell<Vec<String>>>,
+) -> Option<wry::WebView> {
     use std::borrow::Cow;
     use wry::WebViewBuilder;
     use wry::http::{Response, header::CONTENT_TYPE};
@@ -1115,6 +1213,17 @@ fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry:
             .unwrap_or_else(|_| Response::new(Cow::Borrowed(&b""[..])))
     };
 
+    // The page reports its render error state over IPC after each (re)render; we
+    // store it so the `canvas_errors` tool can report it back to the agent.
+    let ipc_errors = errors;
+    let ipc_handler = move |request: wry::http::Request<String>| {
+        let body = request.body();
+        match serde_json::from_str::<CanvasErrorReport>(body) {
+            Ok(report) => *ipc_errors.borrow_mut() = report.errors,
+            Err(err) => log::error!("canvas: bad IPC error report: {err}"),
+        }
+    };
+
     match WebViewBuilder::new_as_child(&parent)
         .with_bounds(initial)
         .with_devtools(false)
@@ -1122,6 +1231,7 @@ fn attach_webview(window: &Window, document: Rc<RefCell<String>>) -> Option<wry:
             "window.addEventListener('contextmenu', function (e) { e.preventDefault(); }, true);",
         )
         .with_custom_protocol("zedcanvas".into(), protocol)
+        .with_ipc_handler(ipc_handler)
         .with_url("zedcanvas://localhost/")
         .build()
     {
@@ -1346,13 +1456,27 @@ const CANVAS_SHELL: &str = r####"<!doctype html>
 <title>CANVAS_TITLE_PLACEHOLDER</title>
 <script>
   // Capture ANY uncaught error (including failures inside Babel's transform or
-  // the compiled scripts, which are outside our try/catch) for the diagnostic.
+  // the compiled scripts, which are outside our try/catch) for the diagnostic,
+  // and report the current error list to the host (Zed) over IPC so the agent
+  // can see when a canvas it wrote is broken.
   window.__canvasErrors = [];
+  window.__reportCanvasErrors = function () {
+    try {
+      if (window.ipc && window.ipc.postMessage) {
+        window.ipc.postMessage(JSON.stringify({ errors: window.__canvasErrors || [] }));
+      }
+    } catch (e) {}
+  };
   window.addEventListener('error', function (e) {
     window.__canvasErrors.push(
       String((e && e.error && e.error.stack) || (e && e.message) || e)
       + (e && e.filename ? (' @ ' + e.filename + ':' + e.lineno) : '')
     );
+    window.__reportCanvasErrors();
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__canvasErrors.push('unhandledrejection: ' + String((e && e.reason && e.reason.stack) || (e && e.reason) || e));
+    window.__reportCanvasErrors();
   });
 </script>
 <script>
@@ -1473,6 +1597,7 @@ Object.assign(window, { cx, useHostTheme, Page, Stack, Row, Grid, Card, Stat, Bu
   (function () {
     function fail(msg) {
       window.__canvasErrors.push(msg);
+      window.__reportCanvasErrors();
       var root = document.getElementById('root');
       if (root) {
         root.innerHTML = '<pre style="white-space:pre-wrap;color:#c0392b;font:13px ui-monospace,monospace;padding:1rem">' + msg + '</pre>';
@@ -1491,6 +1616,8 @@ Object.assign(window, { cx, useHostTheme, Page, Stack, Row, Grid, Card, Stat, Bu
     } catch (e) {
       fail('run: ' + String((e && e.stack) || e));
     }
+    // Report the post-render error state (empty list means success).
+    window.__reportCanvasErrors();
   })();
 </script>
 
