@@ -34,10 +34,7 @@ use surface::{SurfaceId, SurfaceProvider};
 use ui::{LabelSize, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple};
 
 #[cfg(target_os = "macos")]
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
 actions!(
     canvas,
@@ -742,11 +739,6 @@ struct CanvasView {
     // rendered cleanly). Read by the `canvas_errors` tool.
     #[cfg(target_os = "macos")]
     errors: Rc<RefCell<Vec<String>>>,
-    // The floating Canvas/Code toggle's last painted bounds, excluded from the
-    // mouse-passthrough region so the toggle stays clickable while the rest of
-    // the canvas passes events through to the WebView.
-    #[cfg(target_os = "macos")]
-    toggle_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     // Polls the backing file and hot-reloads on change; cancelled when dropped.
     _watch_task: Task<()>,
 }
@@ -797,8 +789,6 @@ impl CanvasView {
             _theme_subscription: theme_subscription,
             #[cfg(target_os = "macos")]
             errors,
-            #[cfg(target_os = "macos")]
-            toggle_bounds: Rc::new(Cell::new(None)),
             _watch_task: watch_task,
         }
     }
@@ -960,7 +950,6 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         {
             let webview = self.webview.clone();
-            let toggle_bounds = self.toggle_bounds.clone();
             div()
                 .size_full()
                 .bg(gpui::transparency_hole())
@@ -969,7 +958,19 @@ impl CanvasView {
                         |_bounds, _window, _cx| {},
                         move |bounds: Bounds<Pixels>, _, window, _cx| {
                             position_webview(webview.as_ref(), bounds);
-                            let rects = passthrough_rects(bounds, toggle_bounds.get());
+                            // Keep the floating toggle (top-right) clickable by
+                            // excluding a fixed region around it from the
+                            // passthrough area; everything else reaches the
+                            // WebView. The region is generous enough to cover the
+                            // toggle at any reasonable theme/font size.
+                            let exclude = Bounds {
+                                origin: point(
+                                    bounds.origin.x + bounds.size.width - px(TOGGLE_REGION_WIDTH),
+                                    bounds.origin.y,
+                                ),
+                                size: size(px(TOGGLE_REGION_WIDTH), px(TOGGLE_REGION_HEIGHT)),
+                            };
+                            let rects = passthrough_rects(bounds, Some(exclude));
                             window.set_mouse_passthrough_rects(rects);
                         },
                     )
@@ -1011,31 +1012,13 @@ impl CanvasView {
         .selected_index(selected_index)
         .auto_width();
 
-        let container = div()
+        div()
             .absolute()
             .top_2()
             .right_2()
             .rounded_md()
             .bg(cx.theme().colors().elevated_surface_background)
-            .child(toggle);
-
-        // Record the toggle's painted bounds so the passthrough region can
-        // exclude it (keeping it clickable over the WebView).
-        #[cfg(target_os = "macos")]
-        let container = {
-            let toggle_bounds = self.toggle_bounds.clone();
-            container.child(
-                canvas(
-                    |_bounds, _window, _cx| {},
-                    move |bounds: Bounds<Pixels>, _, _window, _cx| {
-                        toggle_bounds.set(Some(bounds));
-                    },
-                )
-                .absolute()
-                .size_full(),
-            )
-        };
-        container
+            .child(toggle)
     }
 
     /// A read-only editor over the `.canvas.tsx` source, or a placeholder while
@@ -1086,6 +1069,14 @@ impl Item for CanvasView {
         window.set_mouse_passthrough_rects(Vec::new());
     }
 }
+
+/// Size of the top-right region reserved (excluded from mouse passthrough) for
+/// the floating Canvas/Code toggle, in logical pixels. Generous enough to cover
+/// the toggle at any reasonable theme/font size.
+#[cfg(target_os = "macos")]
+const TOGGLE_REGION_WIDTH: f32 = 200.0;
+#[cfg(target_os = "macos")]
+const TOGGLE_REGION_HEIGHT: f32 = 56.0;
 
 /// The mouse-passthrough rectangles covering `content` minus `exclude` (the
 /// floating toggle), so the WebView receives events everywhere except where the
