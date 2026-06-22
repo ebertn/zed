@@ -9,6 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
+use agent_settings::AgentSettings;
+use settings::Settings as _;
 
 /// Spawn a sub-agent that runs in the background.
 ///
@@ -146,6 +148,29 @@ impl AgentTool for SpawnAgentBackgroundTool {
                 })?;
 
             let label = input.label.clone();
+
+            // Enforce the concurrency cap so a runaway agent can't spawn an
+            // unbounded number of background sub-agents.
+            let (max_concurrent, running) = cx.update(|cx| {
+                let max = AgentSettings::get_global(cx).max_concurrent_background_subagents;
+                let running = self
+                    .environment
+                    .list_subagents(cx)
+                    .into_iter()
+                    .filter(|subagent| subagent.status == "running")
+                    .count();
+                (max, running)
+            });
+            if max_concurrent > 0 && running >= max_concurrent {
+                return Err(SpawnAgentBackgroundToolOutput::Error {
+                    session_id: None,
+                    error: format!(
+                        "Cannot start another background sub-agent: {running} are already \
+                         running (limit {max_concurrent}). Wait for one to finish or cancel \
+                         one with cancel_subagent."
+                    ),
+                });
+            }
 
             let (subagent, session_info) = cx.update(|cx| {
                 let subagent = if let Some(session_id) = input.session_id.clone() {

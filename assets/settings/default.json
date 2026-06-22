@@ -1273,6 +1273,14 @@
     //
     // Default: true
     "cancel_generation_on_terminal_stop": true,
+    // Whether the agent can spawn sub-agents that run in the background.
+    //
+    // Default: true
+    "background_subagents_enabled": true,
+    // The maximum number of background sub-agents that may run at the same time.
+    //
+    // Default: 8
+    "max_concurrent_background_subagents": 8,
     // Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     //
     // Default: false

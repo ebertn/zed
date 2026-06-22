@@ -319,6 +319,18 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub cancel_generation_on_terminal_stop: Option<bool>,
+    /// Whether the agent can spawn sub-agents that run in the background (the
+    /// `spawn_agent_background` family of tools). When disabled, those tools are
+    /// not offered to the model.
+    ///
+    /// Default: true
+    pub background_subagents_enabled: Option<bool>,
+    /// The maximum number of background sub-agents that may run at the same time.
+    /// `spawn_agent_background` returns an error once this many are already
+    /// running, so a runaway agent can't spawn an unbounded number.
+    ///
+    /// Default: 8
+    pub max_concurrent_background_subagents: Option<usize>,
     /// Whether to always use cmd-enter (or ctrl-enter on Linux or Windows) to send messages in the agent panel.
     ///
     /// Default: false

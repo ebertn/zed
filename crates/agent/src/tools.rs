@@ -243,6 +243,19 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
     }
 }
 
+/// Whether `tool_name` is one of the background sub-agent management tools,
+/// gated by the `background_subagents_enabled` setting.
+pub fn is_background_subagent_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        SpawnAgentBackgroundTool::NAME
+            | ListSubagentsTool::NAME
+            | AwaitSubagentTool::NAME
+            | MessageSubagentTool::NAME
+            | CancelSubagentTool::NAME
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
