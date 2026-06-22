@@ -1109,11 +1109,7 @@ impl ActionLog {
         let text_snapshot = buffer.read(cx).text_snapshot();
         let language = buffer.read(cx).language().cloned();
         let language_registry = buffer.read(cx).language_registry();
-        let diff = cx.new(|cx| {
-            let mut diff = BufferDiff::new(&text_snapshot, cx);
-            diff.language_changed(language, language_registry, cx);
-            diff
-        });
+        let diff = cx.new(|cx| BufferDiff::new(&text_snapshot, language, language_registry, cx));
         let (diff_update_tx, diff_update_rx) = mpsc::unbounded();
         let tracked_buffer = TrackedBuffer {
             buffer: buffer.clone(),
