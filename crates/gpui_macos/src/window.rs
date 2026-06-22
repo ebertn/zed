@@ -2267,19 +2267,32 @@ extern "C" fn hit_test(this: &Object, _: Sel, location: NSPoint) -> id {
     }
 }
 
-/// Refuses to make an embedded WKWebView (or any of its descendant views) the
-/// window's first responder, so keyboard focus stays with GPUI even when WebKit
-/// tries to focus its web content on load. The canvas WebView is a display
-/// surface: it still receives mouse events (scroll, text selection) through the
-/// `hitTest:` passthrough, but typing always goes to Zed rather than the page.
-/// All other responders fall back to the default NSWindow behavior; GPUI's own
+/// Controls whether an embedded WKWebView (or a descendant) may become the
+/// window's first responder. We refuse *programmatic* focus grabs — WebKit
+/// focuses its web content when a page loads, which would steal keyboard input
+/// from Zed (typing then beeps). But we *allow* the grab while the user is
+/// actively pressing a mouse button, so click/drag text selection inside the
+/// canvas still works. After such a selection the WebView holds focus until the
+/// user clicks back into Zed, which is the normal AppKit behavior. GPUI's own
 /// views never descend from a WKWebView, so they are unaffected.
 extern "C" fn make_first_responder(this: &Object, _: Sel, responder: id) -> BOOL {
     unsafe {
-        if !responder.is_null() && responder_within_webview(responder) {
+        if !responder.is_null()
+            && responder_within_webview(responder)
+            && !mouse_button_pressed()
+        {
             return NO;
         }
         msg_send![super(this, class!(NSWindow)), makeFirstResponder: responder]
+    }
+}
+
+/// Whether any mouse button is currently held down. Distinguishes a user-driven
+/// focus change (click/drag) from a programmatic one (page load).
+unsafe fn mouse_button_pressed() -> bool {
+    unsafe {
+        let buttons: u64 = msg_send![class!(NSEvent), pressedMouseButtons];
+        buttons != 0
     }
 }
 

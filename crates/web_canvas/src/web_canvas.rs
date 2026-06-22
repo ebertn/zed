@@ -177,6 +177,12 @@ fn refresh_window_transparency(window: AnyWindowHandle, cx: &mut App) {
     };
     if let Err(err) = window.update(cx, |_root, window, _cx| {
         window.set_background_appearance(appearance);
+        // `set_background_appearance` flips the Metal layer's opacity but does not
+        // redraw. Without a redraw the previously-drawn (opaque) frame stays on
+        // screen, so the transparency hole reads black until some other change
+        // happens to dirty the window. Schedule a redraw so the change is visible
+        // immediately.
+        window.refresh();
     }) {
         log::error!("canvas: failed to update window transparency: {err}");
     }
