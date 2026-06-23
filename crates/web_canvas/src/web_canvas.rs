@@ -789,8 +789,15 @@ struct CanvasView {
     // hole recomposites over the freshly-painted WebView. Cancelled when dropped.
     #[cfg(target_os = "macos")]
     _render_task: Task<()>,
-    // Polls the backing file and hot-reloads on change; cancelled when dropped.
-    _watch_task: Task<()>,
+    // The project buffer backing this canvas. The rendered view reads from the
+    // buffer rather than the on-disk file, so the agent's `edit_file` changes -
+    // which live in the buffer and may be unsaved/pending review - show up
+    // immediately. Kept alive here and observed via `_source_subscription`.
+    _source_buffer: Option<Entity<language::Buffer>>,
+    _source_subscription: Option<Subscription>,
+    // The canvas source last pushed to the WebView; used to skip redundant
+    // reloads when the buffer notifies without a content change.
+    source_content: String,
 }
 
 impl CanvasView {
@@ -842,7 +849,36 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         let theme_subscription =
             cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
-        let watch_task = Self::spawn_watch(path.clone(), cx);
+
+        // Source the canvas content from the project buffer for its file, not the
+        // on-disk file: the agent edits via `edit_file`, whose changes live in
+        // the (possibly unsaved / pending-review) buffer. Open the buffer, push
+        // its current text, and reload whenever it changes. The initial disk read
+        // above only seeds the very first frame until the buffer opens.
+        cx.spawn({
+            let path = path.clone();
+            let project = project.clone();
+            async move |this, cx| {
+                let buffer_task =
+                    project.update(cx, |project, cx| project.open_local_buffer(&path, cx));
+                let buffer = match buffer_task.await {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        log::error!("canvas: failed to open source buffer: {err}");
+                        return;
+                    }
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_buffer_content(&buffer, cx);
+                    let subscription = cx.observe(&buffer, |this, buffer, cx| {
+                        this.apply_buffer_content(&buffer, cx);
+                    });
+                    this._source_buffer = Some(buffer);
+                    this._source_subscription = Some(subscription);
+                });
+            }
+        })
+        .detach();
 
         Self {
             title,
@@ -864,38 +900,23 @@ impl CanvasView {
             errors,
             #[cfg(target_os = "macos")]
             _render_task: render_task,
-            _watch_task: watch_task,
+            _source_buffer: None,
+            _source_subscription: None,
+            source_content: content,
         }
     }
 
-    /// Polls the backing file's mtime and hot-reloads the canvas when it changes
-    /// on disk (e.g. after the agent edits it with `edit_file`).
-    fn spawn_watch(path: PathBuf, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            fn mtime(path: &Path) -> Option<std::time::SystemTime> {
-                std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
-            }
-            let mut last = mtime(&path);
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(600))
-                    .await;
-                let current = mtime(&path);
-                if current == last {
-                    continue;
-                }
-                last = current;
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                if this
-                    .update(cx, |this, cx| this.set_content(&content, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
+    /// Reloads the rendered canvas from `buffer`'s current text (skipping the
+    /// reload when the content is unchanged, since `observe` also fires for
+    /// non-content notifications).
+    fn apply_buffer_content(&mut self, buffer: &Entity<language::Buffer>, cx: &mut Context<Self>) {
+        let text = buffer.read(cx).text();
+        if text == self.source_content {
+            return;
+        }
+        self.source_content = text;
+        let content = self.source_content.clone();
+        self.set_content(&content, cx);
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -990,7 +1011,7 @@ impl CanvasView {
             return;
         }
         self.theme_json = theme_json;
-        let content = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let content = self.source_content.clone();
         self.set_content(&content, cx);
     }
 }
