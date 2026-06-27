@@ -129,6 +129,33 @@ mod macos_build {
             PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders.metallib");
         println!("cargo:rerun-if-changed={}", shader_path);
 
+        // `xcrun metal` ships as a separately downloadable Xcode component (the
+        // "Metal Toolchain") that can be absent after an Xcode/macOS update.
+        // `xcrun --find metal` still returns a path in that case, so probe by
+        // actually running the compiler. When it is unusable we cannot build
+        // shaders, but `shaders.metal` and the generated header change rarely, so
+        // reuse a previously-built metallib rather than breaking every unrelated
+        // rebuild. Only hard-fail when there is no cached metallib to fall back on.
+        let metal_usable = Command::new("xcrun")
+            .args(["-sdk", "macosx", "metal", "--version"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !metal_usable {
+            if metallib_output_path.exists() {
+                println!(
+                    "cargo:warning=Metal toolchain unavailable; reusing cached shaders.metallib. \
+                     Run `xcodebuild -downloadComponent MetalToolchain` to enable shader recompilation."
+                );
+                return;
+            }
+            println!(
+                "cargo::error=Metal toolchain unavailable and no cached shaders.metallib exists. \
+                 Install it with: xcodebuild -downloadComponent MetalToolchain"
+            );
+            process::exit(1);
+        }
+
         let output = Command::new("xcrun")
             .args([
                 "-sdk",

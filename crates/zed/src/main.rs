@@ -796,7 +796,17 @@ fn main() {
             let client = app_state.client.clone();
             move |cx| {
                 for &mut window in cx.windows().iter_mut() {
-                    let background_appearance = cx.theme().window_background_appearance();
+                    // A window hosting a canvas WebView must stay transparent so
+                    // the WebView shows through its punched-out hole; forcing the
+                    // theme's (usually opaque) appearance here would turn the hole
+                    // black. This observer fires on any settings change, so it is
+                    // what made canvases go black after e.g. opening a new
+                    // workspace.
+                    let background_appearance = if web_canvas::window_has_live_canvas(window, cx) {
+                        gpui::WindowBackgroundAppearance::Transparent
+                    } else {
+                        cx.theme().window_background_appearance()
+                    };
                     window
                         .update(cx, |_, window, _| {
                             window.set_background_appearance(background_appearance)
