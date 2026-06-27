@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CANVAS_TITLE_PLACEHOLDER</title>
+<script>
+  // Capture ANY uncaught error (including failures inside Babel's transform or
+  // the compiled scripts, which are outside our try/catch) for the diagnostic,
+  // and report the current error list to the host (Zed) over IPC so the agent
+  // can see when a canvas it wrote is broken.
+  window.__canvasErrors = [];
+  window.__reportCanvasErrors = function () {
+    try {
+      if (window.ipc && window.ipc.postMessage) {
+        window.ipc.postMessage(JSON.stringify({ errors: window.__canvasErrors || [] }));
+      }
+    } catch (e) {}
+  };
+  window.addEventListener('error', function (e) {
+    window.__canvasErrors.push(
+      String((e && e.error && e.error.stack) || (e && e.message) || e)
+      + (e && e.filename ? (' @ ' + e.filename + ':' + e.lineno) : '')
+    );
+    window.__reportCanvasErrors();
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    window.__canvasErrors.push('unhandledrejection: ' + String((e && e.reason && e.reason.stack) || (e && e.reason) || e));
+    window.__reportCanvasErrors();
+  });
+</script>
+<script>
+  // Host theme injected by Zed. `useHostTheme()` reads this object; the bootstrap
+  // applies it as a `dark` class (so Tailwind `dark:` variants follow Zed's
+  // active theme rather than the OS setting) and as `--zed-*` CSS variables.
+  window.__zedTheme = "CANVAS_THEME_PLACEHOLDER";
+  (function () {
+    var t = window.__zedTheme;
+    if (!t) return;
+    document.documentElement.classList.toggle('dark', t.kind === 'dark');
+    var root = document.documentElement.style;
+    var colors = t.colors || {};
+    for (var key in colors) {
+      if (Object.prototype.hasOwnProperty.call(colors, key)) {
+        root.setProperty('--zed-' + key, colors[key]);
+      }
+    }
+    // shadcn token variables (HSL triplets like "220 13% 18%").
+    var vars = t.vars || {};
+    for (var name in vars) {
+      if (Object.prototype.hasOwnProperty.call(vars, name)) {
+        root.setProperty('--' + name, vars[name]);
+      }
+    }
+  })();
+</script>
+<script src="zedcanvas://localhost/tailwind.js"></script>
+<script>
+  // Tailwind config wired to the shadcn CSS-variable token theme. The variables
+  // themselves (`--background`, `--primary`, …) are set from the Zed theme by the
+  // bootstrap above.
+  tailwind.config = {
+    darkMode: 'class',
+    theme: {
+      extend: {
+        colors: {
+          border: 'hsl(var(--border))',
+          input: 'hsl(var(--input))',
+          ring: 'hsl(var(--ring))',
+          background: 'hsl(var(--background))',
+          foreground: 'hsl(var(--foreground))',
+          primary: { DEFAULT: 'hsl(var(--primary))', foreground: 'hsl(var(--primary-foreground))' },
+          secondary: { DEFAULT: 'hsl(var(--secondary))', foreground: 'hsl(var(--secondary-foreground))' },
+          destructive: { DEFAULT: 'hsl(var(--destructive))', foreground: 'hsl(var(--destructive-foreground))' },
+          muted: { DEFAULT: 'hsl(var(--muted))', foreground: 'hsl(var(--muted-foreground))' },
+          accent: { DEFAULT: 'hsl(var(--accent))', foreground: 'hsl(var(--accent-foreground))' },
+          popover: { DEFAULT: 'hsl(var(--popover))', foreground: 'hsl(var(--popover-foreground))' },
+          card: { DEFAULT: 'hsl(var(--card))', foreground: 'hsl(var(--card-foreground))' },
+        },
+        borderRadius: { lg: 'var(--radius)', md: 'calc(var(--radius) - 2px)', sm: 'calc(var(--radius) - 4px)' },
+        fontFamily: { serif: ['ETBembo', '"Palatino Linotype"', 'Palatino', 'Georgia', 'serif'] },
+      },
+    },
+  };
+</script>
+<script src="zedcanvas://localhost/sdk.js"></script>
+<script src="zedcanvas://localhost/babel.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; }
+  :root { --radius: 0.5rem; }
+  /* Default border color to the shadcn token (mirrors shadcn's base layer). */
+  * { border-color: hsl(var(--border, 0 0% 85%)); }
+  /* Driven by the host theme via the shadcn `--background`/`--foreground` tokens
+     (set by the theme bootstrap), with light defaults as a fallback. */
+  body { background: hsl(var(--background, 60 100% 99%)); color: hsl(var(--foreground, 0 0% 7%)); }
+  /* Make code / equation blocks theme-aware even outside `prose` (e.g. inside a
+     Card), so agent-authored blocks follow the host theme automatically. */
+  pre, code, kbd, samp { background: var(--zed-element, rgba(0, 0, 0, 0.06)); border-radius: 4px; }
+  #root { min-height: 100%; }
+  /* Theme Recharts' tooltip + hover cursor, which otherwise render as a bright
+     white box and a light-gray block that clash with the host palette. These
+     target Recharts' own DOM (so they don't interfere with how Recharts detects
+     its child components); `!important` overrides Recharts' inline styles. */
+  .recharts-default-tooltip {
+    background: hsl(var(--popover)) !important;
+    border: 1px solid hsl(var(--border)) !important;
+    border-radius: var(--radius);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    color: hsl(var(--popover-foreground)) !important;
+  }
+  .recharts-tooltip-label { color: hsl(var(--popover-foreground)) !important; }
+  /* Each row's text is colored inline by Recharts from the series color, which
+     for several chart types (scatter, radar, funnel, radial, pie) is dark and
+     unreadable on the dark popover. Force the row text to the readable popover
+     foreground; series are still distinguished by their name in the row. */
+  .recharts-tooltip-item,
+  .recharts-tooltip-item-name,
+  .recharts-tooltip-item-separator,
+  .recharts-tooltip-item-value { color: hsl(var(--popover-foreground)) !important; }
+  .recharts-tooltip-cursor { fill: hsl(var(--muted) / 0.3) !important; }
+  /* Recharts animates the tooltip wrapper's position with a transform transition,
+     so it chases the cursor and appears to jitter/vibrate on small moves. Snap it
+     to position instead. */
+  .recharts-tooltip-wrapper { transition: none !important; }
+</style>
+</head>
+<body class="font-serif">
+<div id="root" class="px-8 py-6"></div>
+
+<script type="text/plain" id="canvas-body">
+// CANVAS_BODY_PLACEHOLDER
+</script>
+
+<script>
+  // Transpile the agent's canvas with Babel's stable transform API and run it via
+  // indirect eval (global scope). The React runtime + component library come from
+  // the bundled SDK (sdk.js), which already populated the globals. We avoid
+  // Babel's transformScriptTags / dynamic <script> injection, which throws
+  // (appendChild) inside WKWebView.
+  (function () {
+    function fail(msg) {
+      window.__canvasErrors.push(msg);
+      window.__reportCanvasErrors();
+      var root = document.getElementById('root');
+      if (root) {
+        root.innerHTML = '<pre style="white-space:pre-wrap;color:#c0392b;font:13px ui-monospace,monospace;padding:1rem">' + msg + '</pre>';
+      }
+    }
+    try {
+      if (!window.Babel || !Babel.transform) { return fail('Babel.transform unavailable'); }
+      if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') { return fail('Canvas SDK (sdk.js) failed to load'); }
+      var body = document.getElementById('canvas-body').textContent;
+      (0, eval)(Babel.transform(body, { presets: ['react', 'typescript'], filename: 'canvas.tsx' }).code);
+      var element = (typeof Canvas !== 'undefined')
+        ? React.createElement(Canvas)
+        : React.createElement('div', { className: 'text-rose-600' }, 'Define a top-level: function Canvas() { return (...) }');
+      ReactDOM.createRoot(document.getElementById('root')).render(element);
+    } catch (e) {
+      fail('run: ' + String((e && e.stack) || e));
+    }
+    // Report after the browser has actually painted. `createRoot().render()` is
+    // asynchronous, so reporting synchronously here fires before the WebView has
+    // any pixels; the host would then redraw the transparency hole over an empty
+    // (black) view and never redraw again. A double rAF waits until after the
+    // first paint so the host's redraw composites over real content.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        window.__reportCanvasErrors();
+      });
+    });
+  })();
+</script>
+
+<script>
+  // On-canvas diagnostic: if nothing rendered, report what loaded (so we can
+  // debug without the web inspector).
+  setTimeout(function () {
+    var root = document.getElementById('root');
+    if (root && root.childElementCount === 0) {
+      root.innerHTML = '<pre style="white-space:pre-wrap;color:#c0392b;font:13px ui-monospace,monospace;padding:1rem">'
+        + 'Canvas runtime diagnostic (nothing rendered)\n\n'
+        + 'React: ' + (typeof React) + '\n'
+        + 'ReactDOM: ' + (typeof ReactDOM) + '\n'
+        + 'Babel: ' + (typeof Babel) + '\n'
+        + 'tailwind: ' + (typeof tailwind) + '\n\n'
+        + 'Errors:\n' + ((window.__canvasErrors && window.__canvasErrors.length) ? window.__canvasErrors.join('\n') : '(none captured)')
+        + '</pre>';
+    }
+  }, 2000);
+</script>
+</body>
+</html>

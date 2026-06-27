@@ -158,8 +158,11 @@ fn live_canvases(cx: &App) -> Vec<(u64, SharedString)> {
     canvases
 }
 
-/// Whether `window` currently hosts at least one live canvas.
-fn window_has_live_canvas(window: AnyWindowHandle, cx: &App) -> bool {
+/// Whether `window` currently hosts at least one live canvas. Public so the
+/// window-background logic in `zed::main` can keep canvas-hosting windows
+/// transparent instead of resetting them to the theme's (usually opaque)
+/// appearance whenever settings change.
+pub fn window_has_live_canvas(window: AnyWindowHandle, cx: &App) -> bool {
     let Some(registry) = cx.try_global::<CanvasRegistry>() else {
         return false;
     };
@@ -789,8 +792,21 @@ struct CanvasView {
     // hole recomposites over the freshly-painted WebView. Cancelled when dropped.
     #[cfg(target_os = "macos")]
     _render_task: Task<()>,
-    // Polls the backing file and hot-reloads on change; cancelled when dropped.
-    _watch_task: Task<()>,
+    // The project buffer backing this canvas. The rendered view reads from the
+    // buffer rather than the on-disk file, so the agent's `edit_file` changes -
+    // which live in the buffer and may be unsaved/pending review - show up
+    // immediately. Kept alive here and observed via `_source_subscription`.
+    _source_buffer: Option<Entity<language::Buffer>>,
+    _source_subscription: Option<Subscription>,
+    // Whether the WebView has reported its first real paint. Until then the
+    // rendered view covers the WebView with an opaque theme-colored fill instead
+    // of a transparency hole, so the user never sees the WebView's load sequence
+    // (black -> gray -> white -> page) flash through.
+    #[cfg(target_os = "macos")]
+    has_painted: bool,
+    // The canvas source last pushed to the WebView; used to skip redundant
+    // reloads when the buffer notifies without a content change.
+    source_content: String,
 }
 
 impl CanvasView {
@@ -817,8 +833,14 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         let (render_tx, mut render_rx) = mpsc::unbounded::<()>();
         #[cfg(target_os = "macos")]
-        let webview =
-            attach_webview(window, document.clone(), errors.clone(), render_tx).map(Rc::new);
+        let webview = attach_webview(
+            window,
+            document.clone(),
+            errors.clone(),
+            render_tx,
+            theme_background_rgba(cx),
+        )
+        .map(Rc::new);
         // Redraw the view on every page-render signal. The first signal arrives
         // once the WebView has actually painted, which recomposites the
         // transparency hole over real content instead of a black, unpainted view.
@@ -831,10 +853,21 @@ impl CanvasView {
         let render_task = cx.spawn(async move |this, cx| {
             let mut first_paint = true;
             while render_rx.next().await.is_some() {
-                if this.update(cx, |_this, cx| cx.notify()).is_err() {
+                let painted_now = std::mem::take(&mut first_paint);
+                if this
+                    .update(cx, |this, cx| {
+                        // Reveal the WebView (swap the opaque fill for the
+                        // transparency hole) only once it has actually painted.
+                        if painted_now {
+                            this.has_painted = true;
+                        }
+                        cx.notify()
+                    })
+                    .is_err()
+                {
                     break;
                 }
-                if std::mem::take(&mut first_paint) {
+                if painted_now {
                     cx.update(|cx| refresh_window_transparency(window_handle, cx));
                 }
             }
@@ -842,7 +875,36 @@ impl CanvasView {
         #[cfg(target_os = "macos")]
         let theme_subscription =
             cx.observe_global::<settings::SettingsStore>(|this, cx| this.refresh_theme(cx));
-        let watch_task = Self::spawn_watch(path.clone(), cx);
+
+        // Source the canvas content from the project buffer for its file, not the
+        // on-disk file: the agent edits via `edit_file`, whose changes live in
+        // the (possibly unsaved / pending-review) buffer. Open the buffer, push
+        // its current text, and reload whenever it changes. The initial disk read
+        // above only seeds the very first frame until the buffer opens.
+        cx.spawn({
+            let path = path.clone();
+            let project = project.clone();
+            async move |this, cx| {
+                let buffer_task =
+                    project.update(cx, |project, cx| project.open_local_buffer(&path, cx));
+                let buffer = match buffer_task.await {
+                    Ok(buffer) => buffer,
+                    Err(err) => {
+                        log::error!("canvas: failed to open source buffer: {err}");
+                        return;
+                    }
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_buffer_content(&buffer, cx);
+                    let subscription = cx.observe(&buffer, |this, buffer, cx| {
+                        this.apply_buffer_content(&buffer, cx);
+                    });
+                    this._source_buffer = Some(buffer);
+                    this._source_subscription = Some(subscription);
+                });
+            }
+        })
+        .detach();
 
         Self {
             title,
@@ -864,38 +926,25 @@ impl CanvasView {
             errors,
             #[cfg(target_os = "macos")]
             _render_task: render_task,
-            _watch_task: watch_task,
+            #[cfg(target_os = "macos")]
+            has_painted: false,
+            _source_buffer: None,
+            _source_subscription: None,
+            source_content: content,
         }
     }
 
-    /// Polls the backing file's mtime and hot-reloads the canvas when it changes
-    /// on disk (e.g. after the agent edits it with `edit_file`).
-    fn spawn_watch(path: PathBuf, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            fn mtime(path: &Path) -> Option<std::time::SystemTime> {
-                std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
-            }
-            let mut last = mtime(&path);
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(600))
-                    .await;
-                let current = mtime(&path);
-                if current == last {
-                    continue;
-                }
-                last = current;
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                if this
-                    .update(cx, |this, cx| this.set_content(&content, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
+    /// Reloads the rendered canvas from `buffer`'s current text (skipping the
+    /// reload when the content is unchanged, since `observe` also fires for
+    /// non-content notifications).
+    fn apply_buffer_content(&mut self, buffer: &Entity<language::Buffer>, cx: &mut Context<Self>) {
+        let text = buffer.read(cx).text();
+        if text == self.source_content {
+            return;
+        }
+        self.source_content = text;
+        let content = self.source_content.clone();
+        self.set_content(&content, cx);
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -990,7 +1039,7 @@ impl CanvasView {
             return;
         }
         self.theme_json = theme_json;
-        let content = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let content = self.source_content.clone();
         self.set_content(&content, cx);
     }
 }
@@ -1021,13 +1070,23 @@ impl CanvasView {
     /// hole and registers the hole as a native mouse-passthrough region (minus
     /// the floating toggle's rect) so the WebView receives scroll/selection/
     /// click events while the toggle stays clickable.
-    fn render_canvas_content(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_canvas_content(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         #[cfg(target_os = "macos")]
         {
+            use theme::ActiveTheme as _;
             let webview = self.webview.clone();
+            // Until the WebView reports its first paint, cover it with an opaque
+            // theme-colored fill so its load sequence (black/gray/white) never
+            // flashes through the transparency hole. Once painted, switch to the
+            // hole so the live WebView shows.
+            let background: gpui::Background = if self.has_painted {
+                gpui::transparency_hole()
+            } else {
+                cx.theme().colors().background.into()
+            };
             div()
                 .size_full()
-                .bg(gpui::transparency_hole())
+                .bg(background)
                 .child(
                     canvas(
                         |_bounds, _window, _cx| {},
@@ -1248,6 +1307,7 @@ fn attach_webview(
     document: Rc<RefCell<String>>,
     errors: Rc<RefCell<Vec<String>>>,
     render_signal: mpsc::UnboundedSender<()>,
+    background: (u8, u8, u8, u8),
 ) -> Option<wry::WebView> {
     use std::borrow::Cow;
     use wry::WebViewBuilder;
@@ -1335,6 +1395,11 @@ fn attach_webview(
             // GPUI draws then composites on top. The window's surface is made
             // non-opaque separately by `refresh_window_transparency`.
             order_webview_below_native_view(window);
+            // wry's `with_background_color` is a no-op on macOS, so the WKWebView
+            // keeps its default opaque white fill and flashes white before the
+            // page paints (and when switching between canvases). Paint its backing
+            // layer with the host theme background instead.
+            apply_webview_background(window, background);
             Some(webview)
         }
         Err(err) => {
@@ -1385,6 +1450,56 @@ fn order_webview_below_native_view(window: &Window) {
             positioned: NS_WINDOW_ABOVE
             relativeTo: std::ptr::null_mut::<Object>()
         ];
+    }
+}
+
+/// Paints the canvas `WKWebView`'s backing layer with `(r, g, b, a)` and disables
+/// its default opaque white fill, so it matches the Zed theme background instead
+/// of flashing white before/between page paints. Walks `contentView`'s subviews
+/// to find the WebView (a sibling of GPUI's Metal view).
+#[cfg(target_os = "macos")]
+fn apply_webview_background(window: &Window, (r, g, b, a): (u8, u8, u8, u8)) {
+    use objc::{class, msg_send, runtime::Class, runtime::Object, sel, sel_impl};
+
+    let Some(content_view) = window_content_view(window) else {
+        return;
+    };
+    let content_view = content_view.as_ptr() as *mut Object;
+
+    // SAFETY: `content_view` is the live window contentView; `subviews` returns a
+    // borrowed NSArray of live NSViews. We only message AppKit/Foundation objects
+    // with their documented selectors and guard the KVC/selector calls.
+    unsafe {
+        let Some(webview_class) = Class::get("WKWebView") else {
+            return;
+        };
+        let subviews: *mut Object = msg_send![content_view, subviews];
+        if subviews.is_null() {
+            return;
+        }
+        let count: usize = msg_send![subviews, count];
+        let color: *mut Object = msg_send![class!(NSColor),
+            colorWithSRGBRed: r as f64 / 255.0
+            green: g as f64 / 255.0
+            blue: b as f64 / 255.0
+            alpha: a as f64 / 255.0];
+        for index in 0..count {
+            let view: *mut Object = msg_send![subviews, objectAtIndex: index];
+            let is_webview: bool = msg_send![view, isKindOfClass: webview_class];
+            if !is_webview {
+                continue;
+            }
+            // Keep the WebView opaque (disabling `drawsBackground` makes it
+            // transparent, so the canvas shows black through the window's
+            // transparency hole). Instead, set the color WebKit paints where the
+            // page hasn't yet — this is what flashed white. `underPageBackgroundColor`
+            // is the public macOS 12+ API for it; harmless if unavailable.
+            let responds: bool =
+                msg_send![view, respondsToSelector: sel!(setUnderPageBackgroundColor:)];
+            if responds {
+                let _: () = msg_send![view, setUnderPageBackgroundColor: color];
+            }
+        }
     }
 }
 
@@ -1548,6 +1663,17 @@ fn css_color(color: gpui::Hsla) -> String {
     )
 }
 
+/// The host theme's window background as an opaque `(r, g, b, a)` byte tuple, used
+/// to paint the WebView's backing layer so it never flashes white before (or
+/// between) page paints.
+#[cfg(target_os = "macos")]
+fn theme_background_rgba(cx: &App) -> (u8, u8, u8, u8) {
+    use theme::ActiveTheme as _;
+    let rgba = gpui::Rgba::from(cx.theme().colors().background);
+    let to_u8 = |channel: f32| (channel.clamp(0.0, 1.0) * 255.0).round() as u8;
+    (to_u8(rgba.r), to_u8(rgba.g), to_u8(rgba.b), 255)
+}
+
 /// Formats a GPUI color as a shadcn-style HSL triplet, e.g. `"220 13% 18%"`,
 /// for use as `hsl(var(--token))`.
 fn hsl_triplet(color: gpui::Hsla) -> String {
@@ -1580,174 +1706,7 @@ const CANVAS_BABEL_JS: &str = include_str!("../assets/babel.min.js");
 /// React runtime and component library come from the embedded SDK bundle
 /// (`/sdk.js`); the user's canvas is transpiled in-browser by Babel and mounted
 /// as `<Canvas/>`.
-const CANVAS_SHELL: &str = r####"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>CANVAS_TITLE_PLACEHOLDER</title>
-<script>
-  // Capture ANY uncaught error (including failures inside Babel's transform or
-  // the compiled scripts, which are outside our try/catch) for the diagnostic,
-  // and report the current error list to the host (Zed) over IPC so the agent
-  // can see when a canvas it wrote is broken.
-  window.__canvasErrors = [];
-  window.__reportCanvasErrors = function () {
-    try {
-      if (window.ipc && window.ipc.postMessage) {
-        window.ipc.postMessage(JSON.stringify({ errors: window.__canvasErrors || [] }));
-      }
-    } catch (e) {}
-  };
-  window.addEventListener('error', function (e) {
-    window.__canvasErrors.push(
-      String((e && e.error && e.error.stack) || (e && e.message) || e)
-      + (e && e.filename ? (' @ ' + e.filename + ':' + e.lineno) : '')
-    );
-    window.__reportCanvasErrors();
-  });
-  window.addEventListener('unhandledrejection', function (e) {
-    window.__canvasErrors.push('unhandledrejection: ' + String((e && e.reason && e.reason.stack) || (e && e.reason) || e));
-    window.__reportCanvasErrors();
-  });
-</script>
-<script>
-  // Host theme injected by Zed. `useHostTheme()` reads this object; the bootstrap
-  // applies it as a `dark` class (so Tailwind `dark:` variants follow Zed's
-  // active theme rather than the OS setting) and as `--zed-*` CSS variables.
-  window.__zedTheme = "CANVAS_THEME_PLACEHOLDER";
-  (function () {
-    var t = window.__zedTheme;
-    if (!t) return;
-    document.documentElement.classList.toggle('dark', t.kind === 'dark');
-    var root = document.documentElement.style;
-    var colors = t.colors || {};
-    for (var key in colors) {
-      if (Object.prototype.hasOwnProperty.call(colors, key)) {
-        root.setProperty('--zed-' + key, colors[key]);
-      }
-    }
-    // shadcn token variables (HSL triplets like "220 13% 18%").
-    var vars = t.vars || {};
-    for (var name in vars) {
-      if (Object.prototype.hasOwnProperty.call(vars, name)) {
-        root.setProperty('--' + name, vars[name]);
-      }
-    }
-  })();
-</script>
-<script src="zedcanvas://localhost/tailwind.js"></script>
-<script>
-  // Tailwind config wired to the shadcn CSS-variable token theme. The variables
-  // themselves (`--background`, `--primary`, …) are set from the Zed theme by the
-  // bootstrap above.
-  tailwind.config = {
-    darkMode: 'class',
-    theme: {
-      extend: {
-        colors: {
-          border: 'hsl(var(--border))',
-          input: 'hsl(var(--input))',
-          ring: 'hsl(var(--ring))',
-          background: 'hsl(var(--background))',
-          foreground: 'hsl(var(--foreground))',
-          primary: { DEFAULT: 'hsl(var(--primary))', foreground: 'hsl(var(--primary-foreground))' },
-          secondary: { DEFAULT: 'hsl(var(--secondary))', foreground: 'hsl(var(--secondary-foreground))' },
-          destructive: { DEFAULT: 'hsl(var(--destructive))', foreground: 'hsl(var(--destructive-foreground))' },
-          muted: { DEFAULT: 'hsl(var(--muted))', foreground: 'hsl(var(--muted-foreground))' },
-          accent: { DEFAULT: 'hsl(var(--accent))', foreground: 'hsl(var(--accent-foreground))' },
-          popover: { DEFAULT: 'hsl(var(--popover))', foreground: 'hsl(var(--popover-foreground))' },
-          card: { DEFAULT: 'hsl(var(--card))', foreground: 'hsl(var(--card-foreground))' },
-        },
-        borderRadius: { lg: 'var(--radius)', md: 'calc(var(--radius) - 2px)', sm: 'calc(var(--radius) - 4px)' },
-        fontFamily: { serif: ['ETBembo', '"Palatino Linotype"', 'Palatino', 'Georgia', 'serif'] },
-      },
-    },
-  };
-</script>
-<script src="zedcanvas://localhost/sdk.js"></script>
-<script src="zedcanvas://localhost/babel.js"></script>
-<style>
-  html, body { margin: 0; height: 100%; }
-  :root { --radius: 0.5rem; }
-  /* Default border color to the shadcn token (mirrors shadcn's base layer). */
-  * { border-color: hsl(var(--border, 0 0% 85%)); }
-  /* Driven by the host theme via the shadcn `--background`/`--foreground` tokens
-     (set by the theme bootstrap), with light defaults as a fallback. */
-  body { background: hsl(var(--background, 60 100% 99%)); color: hsl(var(--foreground, 0 0% 7%)); }
-  /* Make code / equation blocks theme-aware even outside `prose` (e.g. inside a
-     Card), so agent-authored blocks follow the host theme automatically. */
-  pre, code, kbd, samp { background: var(--zed-element, rgba(0, 0, 0, 0.06)); border-radius: 4px; }
-  #root { min-height: 100%; }
-</style>
-</head>
-<body class="font-serif">
-<div id="root" class="px-8 py-6"></div>
-
-<script type="text/plain" id="canvas-body">
-// CANVAS_BODY_PLACEHOLDER
-</script>
-
-<script>
-  // Transpile the agent's canvas with Babel's stable transform API and run it via
-  // indirect eval (global scope). The React runtime + component library come from
-  // the bundled SDK (sdk.js), which already populated the globals. We avoid
-  // Babel's transformScriptTags / dynamic <script> injection, which throws
-  // (appendChild) inside WKWebView.
-  (function () {
-    function fail(msg) {
-      window.__canvasErrors.push(msg);
-      window.__reportCanvasErrors();
-      var root = document.getElementById('root');
-      if (root) {
-        root.innerHTML = '<pre style="white-space:pre-wrap;color:#c0392b;font:13px ui-monospace,monospace;padding:1rem">' + msg + '</pre>';
-      }
-    }
-    try {
-      if (!window.Babel || !Babel.transform) { return fail('Babel.transform unavailable'); }
-      if (typeof React === 'undefined' || typeof ReactDOM === 'undefined') { return fail('Canvas SDK (sdk.js) failed to load'); }
-      var body = document.getElementById('canvas-body').textContent;
-      (0, eval)(Babel.transform(body, { presets: ['react', 'typescript'], filename: 'canvas.tsx' }).code);
-      var element = (typeof Canvas !== 'undefined')
-        ? React.createElement(Canvas)
-        : React.createElement('div', { className: 'text-rose-600' }, 'Define a top-level: function Canvas() { return (...) }');
-      ReactDOM.createRoot(document.getElementById('root')).render(element);
-    } catch (e) {
-      fail('run: ' + String((e && e.stack) || e));
-    }
-    // Report after the browser has actually painted. `createRoot().render()` is
-    // asynchronous, so reporting synchronously here fires before the WebView has
-    // any pixels; the host would then redraw the transparency hole over an empty
-    // (black) view and never redraw again. A double rAF waits until after the
-    // first paint so the host's redraw composites over real content.
-    requestAnimationFrame(function () {
-      requestAnimationFrame(function () {
-        window.__reportCanvasErrors();
-      });
-    });
-  })();
-</script>
-
-<script>
-  // On-canvas diagnostic: if nothing rendered, report what loaded (so we can
-  // debug without the web inspector).
-  setTimeout(function () {
-    var root = document.getElementById('root');
-    if (root && root.childElementCount === 0) {
-      root.innerHTML = '<pre style="white-space:pre-wrap;color:#c0392b;font:13px ui-monospace,monospace;padding:1rem">'
-        + 'Canvas runtime diagnostic (nothing rendered)\n\n'
-        + 'React: ' + (typeof React) + '\n'
-        + 'ReactDOM: ' + (typeof ReactDOM) + '\n'
-        + 'Babel: ' + (typeof Babel) + '\n'
-        + 'tailwind: ' + (typeof tailwind) + '\n\n'
-        + 'Errors:\n' + ((window.__canvasErrors && window.__canvasErrors.length) ? window.__canvasErrors.join('\n') : '(none captured)')
-        + '</pre>';
-    }
-  }, 2000);
-</script>
-</body>
-</html>
-"####;
+const CANVAS_SHELL: &str = include_str!("../assets/canvas-shell.html");
 
 /// `tsconfig.json` written into `~/.agents/canvases/` so the TS language server
 /// lints `.canvas.tsx` files (no npm install needed).
