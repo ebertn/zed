@@ -1017,16 +1017,8 @@ impl ThreadView {
                 },
             ));
 
-// Re-render when the native thread changes (e.g. a background
-            // subagent's status updates), so the activity-bar strip and the
-            // subagent cards reflect live status.
-            if let Some(native_thread) =
-                native_connection.thread(thread.read(cx).session_id(), cx)
+            if let Some(native_thread) = native_connection.thread(thread.read(cx).session_id(), cx)
             {
-                subscriptions.push(cx.observe(&native_thread, |_this, _native_thread, cx| {
-                    cx.notify();
-                }));
-
                 // A "no model selected" error is stale as soon as the thread has a
                 // usable model
                 subscriptions.push(cx.subscribe(
@@ -1037,6 +1029,13 @@ impl ThreadView {
                         }
                     },
                 ));
+
+                // Re-render when the native thread changes (e.g. a background
+                // subagent's status updates), so the activity-bar strip and the
+                // subagent cards reflect live status.
+                subscriptions.push(cx.observe(&native_thread, |_this, _native_thread, cx| {
+                    cx.notify();
+                }));
             }
         }
 
@@ -3270,10 +3269,7 @@ impl ThreadView {
                     })
                     .when(has_subagents, |this| {
                         this.when(
-                            has_awaiting_permission
-                                || !plan.is_empty()
-                                || !changed_buffers.is_empty()
-                                || !canvases.is_empty(),
+                            !plan.is_empty() || !changed_buffers.is_empty() || !canvases.is_empty(),
                             |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                         )
                         .child(self.render_subagents_summary(&background_subagents, cx))
@@ -11315,7 +11311,7 @@ impl ThreadView {
         let files_changed = changed_buffers.len();
         let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
-// For background subagents the spawn tool completes immediately, so the
+        // For background subagents the spawn tool completes immediately, so the
         // tool-call status doesn't track the subagent's real progress. Prefer the
         // live background-subagent status recorded on the parent thread; fall back
         // to the tool-call status for inline (blocking) subagents.

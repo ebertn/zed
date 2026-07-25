@@ -3843,8 +3843,8 @@ impl Thread {
         let inline_limit = AgentSettings::get_global(cx).tool_output_inline_limit;
         let thread_id = self.id.to_string();
         let ui_event_stream = event_stream.clone();
-        let ui_tool_use_id = tool_use_id.clone();
         let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use_id);
+        let ui_tool_call_id = tool_call_id.clone();
         let tool_event_stream = ToolCallEventStream::new(
             tool_use_id.clone(),
             tool_call_id,
@@ -3922,7 +3922,7 @@ impl Thread {
             if let Some(spilled) = &offloaded.spilled {
                 notify_offloaded_tool_output_in_ui(
                     &ui_event_stream,
-                    &ui_tool_use_id,
+                    &ui_tool_call_id,
                     spilled,
                     inline_limit,
                 );
@@ -5714,7 +5714,7 @@ async fn offload_large_tool_output(
 /// was cached and open the full data with a click.
 fn notify_offloaded_tool_output_in_ui(
     event_stream: &ThreadEventStream,
-    tool_use_id: &LanguageModelToolUseId,
+    tool_call_id: &acp::ToolCallId,
     spilled: &SpilledToolOutput,
     inline_limit: usize,
 ) {
@@ -5728,7 +5728,7 @@ fn notify_offloaded_tool_output_in_ui(
         spilled.byte_count, inline_limit,
     );
     event_stream.update_tool_call_fields(
-        tool_use_id,
+        tool_call_id,
         acp::ToolCallUpdateFields::new().content(vec![
             acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
                 acp::TextContent::new(notice),
