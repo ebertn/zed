@@ -8619,7 +8619,7 @@ impl Sidebar {
                             let this = this.clone();
                             menu = menu.submenu_with_icon(
                                 "Display",
-                                IconName::Sliders,
+                                IconName::Filter,
                                 move |mut submenu, _window, submenu_cx| {
                                     let display =
                                         AgentSettings::get_global(submenu_cx).thread_list_display;
@@ -8766,7 +8766,7 @@ impl Sidebar {
                 ))
             })
             .trigger_with_tooltip(
-                IconButton::new("group-by", IconName::ListFilter)
+                IconButton::new("group-by", IconName::Filter)
                     .icon_size(IconSize::Small)
                     .toggle_state(self.has_active_filter())
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent)),

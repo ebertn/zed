@@ -20,7 +20,7 @@ use gpui::{
 use workspace::{Item, Workspace};
 
 use agent::{AgentTool, Thread, ToolCallEventStream, ToolInput};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
 use editor::Editor;
 use project::Project;

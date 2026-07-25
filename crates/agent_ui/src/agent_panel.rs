@@ -10780,7 +10780,6 @@ mod tests {
             action_log: Vec::new(),
             background_subagents: Vec::new(),
             sandbox_grants: Default::default(),
-            background_subagents: Vec::new(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));
