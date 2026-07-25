@@ -1006,7 +1006,6 @@ mod tests {
             expand_terminal_card: true,
             terminal_init_command: None,
             cancel_generation_on_terminal_stop: true,
-            interrupt_turn_for_queued_message: false,
             background_subagents_enabled: true,
             max_concurrent_background_subagents: 8,
             use_modifier_to_send: true,

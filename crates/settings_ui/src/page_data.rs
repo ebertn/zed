@@ -8415,29 +8415,6 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Interrupt Turn For Queued Message",
-                description: "Whether a message queued while the agent is generating should interrupt the agent at the next tool-call boundary. The currently-running tool always finishes first. When disabled, the agent completes its full turn before the queued message is sent.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("agent.interrupt_turn_for_queued_message"),
-                    pick: |settings_content| {
-                        settings_content
-                            .agent
-                            .as_ref()?
-                            .interrupt_turn_for_queued_message
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .agent
-                            .get_or_insert_default()
-                            .interrupt_turn_for_queued_message = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
                 title: "Background Sub-Agents",
                 description: "Whether the agent can spawn sub-agents that run in the background.",
                 field: Box::new(SettingField {

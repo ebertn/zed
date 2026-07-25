@@ -3297,10 +3297,8 @@ impl Thread {
             } else if end_turn {
                 return Ok(());
             } else {
-                let interrupt_for_queued = this.update(cx, |this, cx| {
-                    this.end_turn_at_next_boundary()
-                        && AgentSettings::get_global(cx).interrupt_turn_for_queued_message
-                })?;
+                let interrupt_for_queued =
+                    this.update(cx, |this, _cx| this.end_turn_at_next_boundary())?;
                 if interrupt_for_queued {
                     log::debug!("Queued message found, ending turn at message boundary");
                     return Ok(());

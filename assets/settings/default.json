@@ -1307,13 +1307,6 @@
     //
     // Default: true
     "cancel_generation_on_terminal_stop": true,
-    // Whether a message queued while the agent is generating should interrupt
-    // the agent at the next tool-call boundary. The currently-running tool
-    // always finishes first. When disabled, the agent completes its full turn
-    // before the queued message is sent.
-    //
-    // Default: false
-    "interrupt_turn_for_queued_message": false,
     // Whether the agent can spawn sub-agents that run in the background.
     //
     // Default: true

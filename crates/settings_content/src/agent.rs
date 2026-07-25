@@ -452,13 +452,6 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub cancel_generation_on_terminal_stop: Option<bool>,
-    /// Whether a message queued while the agent is generating should interrupt
-    /// the agent at the next tool-call boundary. The currently-running tool
-    /// always finishes first. When disabled, the agent completes its full turn
-    /// before the queued message is sent.
-    ///
-    /// Default: false
-    pub interrupt_turn_for_queued_message: Option<bool>,
     /// Whether the agent can spawn sub-agents that run in the background (the
     /// `spawn_agent_background` family of tools). When disabled, those tools are
     /// not offered to the model.
