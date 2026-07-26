@@ -1925,15 +1925,15 @@ impl AgentPanel {
         if self.selected_agent != agent {
             self.selected_agent = agent.clone();
             self.serialize(cx);
-        }
 
-        cx.background_spawn({
-            let kvp = KeyValueStore::global(cx);
-            async move {
-                write_global_last_used_agent(kvp, agent).await;
-            }
-        })
-        .detach();
+            cx.background_spawn({
+                let kvp = KeyValueStore::global(cx);
+                async move {
+                    write_global_last_used_agent(kvp, agent).await;
+                }
+            })
+            .detach();
+        }
     }
 
     /// Sets the panel's selected agent without opening the panel or focusing
