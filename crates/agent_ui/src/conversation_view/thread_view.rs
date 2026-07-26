@@ -8082,7 +8082,7 @@ impl ThreadView {
                 div()
                     .id(content_id)
                     .max_h(max_height)
-                    .overflow_hidden()
+                    .overflow_x_hidden()
                     // Only the expanded state scrolls. While expanded we drive
                     // the scroll ourselves and occlude so the thread list
                     // behind the block doesn't also scroll (its wheel handler
@@ -8090,6 +8090,11 @@ impl ThreadView {
                     // the block's top/bottom edges we carry the scroll out to
                     // the thread. Collapsed blocks aren't scrollable, so the
                     // wheel just scrolls the thread.
+                    .when_else(
+                        is_expanded,
+                        |this| this.overflow_y_scroll(),
+                        |this| this.overflow_y_hidden(),
+                    )
                     .when(is_expanded, |this| {
                         this.track_scroll(&scroll_handle)
                             .occlude()
