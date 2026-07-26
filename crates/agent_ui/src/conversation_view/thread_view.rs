@@ -305,6 +305,33 @@ fn constrained_block_cap_lines(
 /// Factor by which expanding a constrained output block raises its line cap.
 const OUTPUT_BLOCK_EXPANDED_FACTOR: usize = 2;
 
+/// Estimates how many visual rows `text` wraps to, assuming an average of
+/// `chars_per_line` characters fit per row. Splits on explicit newlines
+/// first, then estimates word-wrap for each resulting line, so a message
+/// with no manual line breaks (one long paragraph) is counted by its wrapped
+/// height rather than as a single line.
+fn estimate_wrapped_line_count(text: &str, chars_per_line: usize) -> usize {
+    if chars_per_line == 0 {
+        return text.lines().count().max(1);
+    }
+    text.lines()
+        .map(|line| line.chars().count().div_ceil(chars_per_line).max(1))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Whether a wheel-scroll `delta_y` on an expanded, height-capped output
+/// block should be carried out to the surrounding thread rather than left
+/// for the block's own scroll handling (driven separately by `track_scroll`
+/// + `overflow_y_scroll`): true when the block is already at the edge the
+/// delta is pushing toward (top and scrolling up, or bottom and scrolling
+/// down), i.e. it has nowhere further to go.
+fn constrained_block_scroll_at_edge(offset_y: Pixels, max_y: Pixels, delta_y: Pixels) -> bool {
+    let at_top = offset_y >= px(0.) && delta_y > px(0.);
+    let at_bottom = offset_y <= -max_y && delta_y < px(0.);
+    at_top || at_bottom
+}
+
 /// Walks `code` exactly once: for each line it validates and strips the
 /// `NNN\t` prefix, then pushes the line's content into the accumulating
 /// code buffer (with `\n` between lines, no trailing newline). Verifies that
@@ -522,6 +549,56 @@ mod numbered_code_block_tests {
             constrained_block_cap_lines(24, 100_000, true),
             Some(24 * OUTPUT_BLOCK_EXPANDED_FACTOR)
         );
+    }
+
+    #[test]
+    fn estimate_wrapped_line_count_counts_explicit_newlines() {
+        assert_eq!(estimate_wrapped_line_count("one\ntwo\nthree", 80), 3);
+        assert_eq!(estimate_wrapped_line_count("", 80), 1);
+        assert_eq!(estimate_wrapped_line_count("just one line", 80), 1);
+    }
+
+    #[test]
+    fn estimate_wrapped_line_count_wraps_long_lines_with_no_newlines() {
+        // A single paragraph with no manual line breaks should still be
+        // counted by how many rows it wraps to, not as one line -- this is
+        // exactly the case that let a long, unbroken user message skip the
+        // inline-collapse threshold entirely.
+        let paragraph = "a".repeat(285);
+        assert_eq!(estimate_wrapped_line_count(&paragraph, 80), 4);
+        // Exact multiples of the assumed width don't overcount.
+        assert_eq!(estimate_wrapped_line_count(&"a".repeat(160), 80), 2);
+        // A zero width falls back to counting explicit lines only, rather
+        // than dividing by zero.
+        assert_eq!(estimate_wrapped_line_count(&"a".repeat(500), 0), 1);
+    }
+
+    #[test]
+    fn estimate_wrapped_line_count_sums_wrapped_rows_across_explicit_lines() {
+        let text = format!("{}\nshort", "a".repeat(200));
+        // First line wraps to 3 rows (200 / 80 rounded up), plus 1 for "short".
+        assert_eq!(estimate_wrapped_line_count(&text, 80), 4);
+    }
+
+    #[test]
+    fn constrained_block_scroll_at_edge_only_when_pushing_past_the_end() {
+        let max_y = px(500.);
+        // At the top (offset 0) and scrolling further up: carry to the thread.
+        assert!(constrained_block_scroll_at_edge(px(0.), max_y, px(10.)));
+        // At the bottom (offset -max_y) and scrolling further down: carry to
+        // the thread.
+        assert!(constrained_block_scroll_at_edge(-max_y, max_y, px(-10.)));
+        // At the top but scrolling down (into the block, not past the edge):
+        // let the block handle it.
+        assert!(!constrained_block_scroll_at_edge(px(0.), max_y, px(-10.)));
+        // At the bottom but scrolling up (into the block): let the block
+        // handle it.
+        assert!(!constrained_block_scroll_at_edge(-max_y, max_y, px(10.)));
+        // Somewhere in the middle: never carry to the thread regardless of
+        // direction.
+        let middle = px(-250.);
+        assert!(!constrained_block_scroll_at_edge(middle, max_y, px(10.)));
+        assert!(!constrained_block_scroll_at_edge(middle, max_y, px(-10.)));
     }
 
     #[test]
@@ -6656,16 +6733,20 @@ impl ThreadView {
                     settings.agent_buffer_font_size(cx) * settings.buffer_line_height.value()
                 };
                 let collapsed_body_cap = editor_line_height * 4.;
-                // A message is "long" (and gets collapsed) when its rendered body
-                // would exceed a few lines. Count newlines in text blocks plus a
-                // row per attachment (image/resource), so attachment-heavy
-                // messages collapse too — markdown text-line counting alone misses
-                // them.
+                // A message is "long" (and gets collapsed) when its rendered
+                // body would exceed a few lines. Estimate wrapped rows per
+                // text block (so a long message with no manual line breaks
+                // collapses too, not just messages with explicit line
+                // breaks), plus a row per attachment (image/resource), so
+                // attachment-heavy messages collapse too.
+                const ASSUMED_WRAP_CHARS_PER_LINE: usize = 80;
                 let estimated_body_lines: usize = message
                     .chunks
                     .iter()
                     .map(|chunk| match chunk {
-                        acp::ContentBlock::Text(text) => text.text.lines().count().max(1),
+                        acp::ContentBlock::Text(text) => {
+                            estimate_wrapped_line_count(&text.text, ASSUMED_WRAP_CHARS_PER_LINE)
+                        }
                         _ => 1,
                     })
                     .sum();
@@ -8107,16 +8188,19 @@ impl ThreadView {
                                     }
                                     let offset = scroll_handle.offset();
                                     let max_y = scroll_handle.max_offset().y;
-                                    let new_y = (offset.y + delta).clamp(-max_y, px(0.));
-                                    if new_y != offset.y {
-                                        // The block can still move: scroll it.
-                                        scroll_handle.set_offset(gpui::point(offset.x, new_y));
-                                    } else {
-                                        // At the top/bottom edge: carry the
-                                        // scroll over to the surrounding thread.
+                                    // gpui's own scroll handling (enabled via
+                                    // `track_scroll` + `overflow_y_scroll`)
+                                    // already moves the block's content in
+                                    // response to this same wheel event. Only
+                                    // step in when it has nowhere further to
+                                    // go -- i.e. we're already at the
+                                    // top/bottom edge -- and carry the scroll
+                                    // out to the surrounding thread instead of
+                                    // letting it get silently absorbed here.
+                                    if constrained_block_scroll_at_edge(offset.y, max_y, delta) {
                                         this.list_state.scroll_by(-delta);
+                                        cx.notify();
                                     }
-                                    cx.notify();
                                 }
                             }))
                     })
